@@ -1,11 +1,22 @@
 ---
 name: orchestrate-codex-tasks
-description: Coordinate the current Codex task as a Controller with multiple independent Codex Worker tasks/threads through task creation, cross-task messages, status-title updates, monitoring, worktree isolation, and result synthesis. Use only when the user explicitly invokes this skill to execute work or clearly asks for separate, independent, or background Codex tasks, a Controller + Worker workflow, cross-task coordination, “主控 + Worker”, “独立任务并发”, or “跨任务并发”. Do not use for Codex subagents, generic requests to work faster, vague parallelism, shell/program concurrency, simple tightly coupled work, or requests that do not authorize creating new Codex tasks.
+description: Coordinate the current Codex task as a Controller with multiple independent Codex Worker tasks/threads through task creation, cross-task messages, status-title updates, monitoring, worktree isolation, and result synthesis. Run all visible coordination in English or Chinese to match the user's orchestration request. Use only when the user explicitly invokes this skill to execute work or clearly asks for separate, independent, or background Codex tasks, a Controller + Worker workflow, cross-task coordination, “主控 + Worker”, “独立任务并发”, or “跨任务并发”. Do not use for Codex subagents, generic requests to work faster, vague parallelism, shell/program concurrency, simple tightly coupled work, or requests that do not authorize creating new Codex tasks.
 ---
 
 # Orchestrate Codex Tasks
 
 把当前 Codex 任务作为唯一主控（Controller），把适合独立执行的工作派发给新建的 Codex Worker 任务。Worker 必须是独立任务，不是子 Agent。
+
+## 运行语言
+
+在首次用户可见汇报、任务改名或 Worker 创建之前确定 `runLanguage`：
+
+1. 用户明确指定协调或会话语言时，使用该语言。
+2. 否则只判断触发本次编排的用户自然语言；忽略代码、路径、引用内容，以及交付物自身的目标语言。
+3. 中文请求使用 `zh-CN`，英文请求使用 `en`。中英文混合且无法明确判断时，使用最后一个有实际语义的用户自然语言句子，不要仅为语言选择阻塞运行。
+4. 把 `runLanguage` 写入运行账本，并在本次运行中保持不变。用户之后明确要求切换时，按 protocol reference 的 `LANGUAGE_UPDATE` 流程更新主控和所有活跃 Worker。
+
+把 `runLanguage` 应用于主控回复、进度汇报、任务标题、Worker Prompt、消息正文、阻塞选项、验收和最终汇总。协议枚举、字段名、工具名、ID、路径、命令和代码保持原样。交付物语言由任务要求决定，不得反向改变协调语言；例如，中文请求编写英文 README 时，协调仍使用中文。
 
 ## 强制边界
 
@@ -21,8 +32,9 @@ description: Coordinate the current Codex task as a Controller with multiple ind
 在创建第一个 Worker 前：
 
 1. 完整读取 [references/tool-contracts.md](references/tool-contracts.md)，确认当前任务工具、worktree、远程主机和 Handoff 契约。
-2. 完整读取 [references/protocol.md](references/protocol.md)，使用其中的 Worker Prompt、消息格式、标题状态机和运行账本。
-3. 如果当前运行时工具契约与 reference 不同，以当前可调用工具的 schema 为准，并向用户说明会影响行为的差异。
+2. 完整读取 [references/protocol.md](references/protocol.md)，使用其中的语言规则、消息格式、标题状态机和运行账本。
+3. `runLanguage=en` 时完整读取 [references/worker-prompt.en.md](references/worker-prompt.en.md)；`runLanguage=zh-CN` 时完整读取 [references/worker-prompt.zh-CN.md](references/worker-prompt.zh-CN.md)。只加载并派发匹配语言的模板。
+4. 如果当前运行时工具契约与 reference 不同，以当前可调用工具的 schema 为准，并用 `runLanguage` 向用户说明会影响行为的差异。
 
 ## 1. 执行授权门
 
@@ -49,11 +61,7 @@ description: Coordinate the current Codex task as a Controller with multiple ind
    - 列出项目；
    - 写代码时还需具备 Handoff 及其状态查询能力，或在派发前确定用户认可的替代回收方案。
 2. 生成短且本次唯一的 `runId`，例如 `R7K2`。
-3. 立即把当前任务改名为：
-
-   ```text
-   👑 [<runId>] 拆解｜<总体目标>
-   ```
+3. 立即使用 protocol reference 中匹配 `runLanguage` 的 `PLANNING` 模板给当前任务改名。
 
 4. 获取并验证当前主控的 `threadId`；跨主机时同时获取 `hostId`。优先使用运行时直接提供的地址，否则用唯一 `runId` 标题从任务列表解析。不能得到唯一匹配时，停止并向用户报告。
 5. 解析并发上限：
@@ -91,19 +99,9 @@ description: Coordinate the current Codex task as a Controller with multiple ind
    - 文件写入边界、成果回收方式和验收命令。
 3. 创建独立任务；除非用户明确指定，否则不覆盖 Worker 的模型或 reasoning 配置。
 4. 记录返回的 `threadId` 或 `clientThreadId`、`hostId`、环境和状态。
-5. 获得真实 `threadId` 后立即改名：
-
-   ```text
-   ✍️ [<runId>-<workerId>] <动宾短语>
-   ```
-
-6. 首波派发完成后，把主控改名为：
-
-   ```text
-   👑 [<runId>] 跟进 <N> 个 Worker｜<总体目标>
-   ```
-
-7. 立即向用户报告 Worker 名称、目标、当前活跃数、排队数、并发上限、worktree 起始状态和任何远程主机选择。
+5. 获得真实 `threadId` 后，立即使用匹配 `runLanguage` 的 `RUNNING` Worker 标题模板改名。
+6. 首波派发完成后，使用匹配 `runLanguage` 的 `TRACKING` 模板更新主控标题。
+7. 立即用 `runLanguage` 向用户报告 Worker 名称、目标、当前活跃数、排队数、并发上限、worktree 起始状态和任何远程主机选择。
 
 worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在解析到真实 `threadId` 前，不对临时 ID 调用等待、改名或跨任务消息工具，也不重复创建相同 Worker。
 
@@ -129,17 +127,13 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 
 收到 `BLOCKED` 或发现等待用户/外部条件时：
 
-1. 立即把 Worker 标题改为：
-
-   ```text
-   ⌛️ [<runId>-<workerId>] <任务名称>｜<阻塞摘要>
-   ```
+1. 立即使用匹配 `runLanguage` 的 `BLOCKED` Worker 标题模板改名。
 
 2. 判断是否能在原始授权内安全决定。
 3. 能决定时，记录决定并用 `DECISION` 消息回复；Worker 恢复后改回 `✍️`。
 4. 需要用户决定时：
-   - 把主控标题改为 `👑 [<runId>] 等待主人确认｜<总体目标>`；
-   - 立即报告事实、选项、建议和不决策的影响；
+   - 使用匹配 `runLanguage` 的 `WAITING_FOR_USER` 模板更新主控标题；
+   - 立即用 `runLanguage` 报告事实、选项、建议和不决策的影响；
    - 暂停受影响路径，继续不相关且安全的工作。
 5. 不因阻塞自动扩大范围、权限或外部影响。
 
@@ -158,11 +152,7 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
    - 再回收到 Local；
    - 在 Local 上运行组合验证。
 6. Handoff 或组合验证冲突时改为 `⌛️`，保留 worktree，不做破坏性 Git 清理，不让 Worker 无边界地修改 Local。
-7. 只有主控验收和必要的 Local 组合验证都通过后，才改名：
-
-   ```text
-   ✅ [<runId>-<workerId>] <任务名称>
-   ```
+7. 只有主控验收和必要的 Local 组合验证都通过后，才使用匹配 `runLanguage` 的 `DONE` Worker 标题模板改名。
 
 8. 标记 `✅` 后释放槽位并派发下一波，但保留该任务，不归档。
 
@@ -172,13 +162,8 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 
 全部 Worker 已验收并完成总体组合验证后：
 
-1. 把主控改名为：
-
-   ```text
-   👑 [<runId>] 完成｜<总体目标>
-   ```
-
-2. 向用户汇报总体结果、Worker 状态、关键决定、代码回收、验证证据和残余风险。
+1. 使用匹配 `runLanguage` 的 `COMPLETE` 模板更新主控标题。
+2. 用 `runLanguage` 向用户汇报总体结果、Worker 状态、关键决定、代码回收、验证证据和残余风险。
 3. 保留所有 `✅`、`⌛️` 和主控任务。
 4. 不调用任何归档工具。用户未来明确提出归档时，把它视为本 Skill 之外的独立操作。
 
@@ -196,8 +181,9 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 
 1. 使用 `runId` 搜索任务标题。
 2. 用任务列表重建 Worker 集合。
-3. 用任务读取工具恢复近期状态和证据。
-4. 按 `runId + workerId + seq` 去重消息。
-5. 不因恢复失败创建重复 Worker。
+3. 从运行账本恢复 `runLanguage`；账本不可用时，从主控标题和最近一条实质性用户请求恢复。
+4. 用任务读取工具恢复近期状态和证据。
+5. 按 `runId + workerId + seq` 去重消息。
+6. 不因恢复失败创建重复 Worker。
 
 始终把账本作为逻辑状态、标题作为用户可见投影。标题更新失败时有限重试并报告，但不要丢弃 Worker 成果或违反禁止归档规则。

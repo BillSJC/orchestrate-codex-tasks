@@ -1,190 +1,206 @@
+**English** | [中文](README.zh-CN.md)
+
 # Codex Task Orchestrator
 
-`orchestrate-codex-tasks` 是一个 Codex Skill。它把当前任务作为唯一主控（Controller），创建多个可在任务列表中独立存在的 Worker 任务，并通过跨任务消息完成派发、阻塞处理、验收和结果汇总。
+`orchestrate-codex-tasks` is a Codex Skill that turns the current task into the single Controller, creates independently visible Worker tasks, and coordinates dispatch, blockers, acceptance, and result synthesis through cross-task messages.
 
-> Worker 是独立 Codex 任务，不是 Codex 子 Agent。
+> Workers are independent Codex tasks, not Codex subagents.
 
-## 1. 安装
+## 1. Installation
 
-### 推荐：让 Codex 自动安装
+### Recommended: let Codex install the Skill
 
-在任意 Codex 任务中发送：
+Send this in any Codex task:
 
 ```text
-请使用 $skill-installer，从下面的 GitHub 地址安装这个 Skill：
+Use $skill-installer to install this Skill from:
 https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/orchestrate-codex-tasks
 ```
 
-安装完成后，在新的任务中使用 `$orchestrate-codex-tasks`。如果 Skill 没有立即出现，重启 Codex 后再检查。
+Use `$orchestrate-codex-tasks` in a new task after installation. If the Skill does not appear immediately, restart Codex and check again.
 
-可以用下面的 Prompt 做一次无副作用确认：
+You can confirm the installation without creating Workers:
 
 ```text
-请确认你已加载 $orchestrate-codex-tasks，并概述它的触发条件；不要创建 Worker。
+Confirm that $orchestrate-codex-tasks is loaded and summarize its trigger conditions.
+Do not create any Workers.
 ```
 
-### 仅在某个仓库中使用
+### Repository-scoped installation
 
-把本仓库中的 Skill 目录复制到目标仓库的相同位置：
+Copy the Skill directory from this repository to the same location in the target repository:
 
 ```text
 <target-repo>/.agents/skills/orchestrate-codex-tasks/
 ```
 
-Codex 从该仓库或其子目录启动时即可发现它。
+Codex can discover it when launched from that repository or one of its subdirectories.
 
-### 用户级手动安装
+### Manual user-level installation
 
-也可以把 Skill 目录复制或链接到：
+You can also copy or symlink the Skill directory to:
 
 ```text
 $HOME/.agents/skills/orchestrate-codex-tasks/
 ```
 
-私有 GitHub 仓库应使用机器上已有的 GitHub 凭据。不要把访问令牌或私钥粘贴到普通 Codex Prompt 中。
+For private GitHub repositories, use credentials already configured on the machine. Do not paste access tokens or private keys into a normal Codex Prompt.
 
-## 2. 何时使用，如何使用
+## 2. When and How to Use It
 
-### 适合使用
+### Good use cases
 
-- 一项工作能拆成两个或更多边界清晰、可以独立验收的子任务。
-- 希望多个 Codex 任务在后台并行推进，并在任务列表中分别查看或继续交流。
-- 希望由一个主控统一处理范围、依赖、决策、冲突和最终验收。
-- 多个 Worker 需要分别研究资料、分析不同模块，或在独立 worktree 中编写代码。
-- 需要跨本地或远程主机调度，同时让结果回到当前主控任务。
+- The work can be divided into two or more clearly bounded subtasks with independent acceptance criteria.
+- You want multiple Codex tasks to progress in the background and remain individually visible and interactive.
+- You want one Controller to own scope, dependencies, decisions, conflicts, and final acceptance.
+- Workers need to research different topics, inspect separate modules, or write code in isolated worktrees.
+- You need local or remote-host execution while keeping coordination in the current Controller task.
 
-### 不适合使用
+### Poor use cases
 
-- 单一、短小或必须严格串行完成的工作。
-- 子任务高度耦合，多个执行者会频繁修改同一接口或同一批文件。
-- 只是希望普通程序、测试或 shell 命令并发运行。
-- 用户明确要求的是 Codex 子 Agent，而不是独立任务。
-- 只有“快一点”“能不能并行”等模糊信号，尚未明确授权创建新任务。
+- A small, single-step task or work that must be strictly sequential.
+- Highly coupled subtasks that repeatedly modify the same interface or files.
+- Ordinary process, test, or shell-command concurrency.
+- A request specifically asking for Codex subagents rather than independent tasks.
+- Vague signals such as “make it faster” or “can this run in parallel” that do not clearly authorize new tasks.
 
-### 确定性触发
+### Deterministic invocation
 
-最可靠的方式是直接点名 Skill：
-
-```text
-使用 $orchestrate-codex-tasks，把下面工作拆成独立 Codex Worker 任务并发执行，
-由当前任务统一协调、验收和汇总：……
-```
-
-也可以使用明确的自然语言：
+The most reliable approach is to name the Skill:
 
 ```text
-创建几个独立 Codex 任务并行完成这些工作。
-使用主控 + Worker 模式，由当前任务通过跨任务消息统一协调。
+Use $orchestrate-codex-tasks to split the following work into independent Codex Worker tasks.
+Coordinate, validate, and synthesize their results from the current task: ...
 ```
 
-### 设置并发度
-
-默认最多有 8 个活跃 Worker，但不会为了填满 8 个槽位而制造无意义任务。可以在开始时指定其他上限：
+You can also use explicit natural language:
 
 ```text
-使用 $orchestrate-codex-tasks 执行下面任务，最大活跃 Worker 设置为 4：……
+Create several independent Codex tasks to complete this work in parallel.
+Use a Controller + Worker workflow and coordinate them through cross-task messages.
 ```
 
-运行中也可以要求主控调整上限：
+### Set the concurrency limit
+
+The default limit is 8 active Workers, but the Skill does not create low-value tasks merely to fill all 8 slots. Set another limit when starting:
 
 ```text
-把最大活跃 Worker 从 8 调整为 3。
+Use $orchestrate-codex-tasks for the following work with at most 4 active Workers: ...
 ```
 
-降低上限不会自动中断已经运行的 Worker，只会暂停新的派发。
-
-### 指定代码基线
-
-写代码的 Worker 默认从项目默认分支创建独立 worktree。如果任务必须看到当前未提交修改，需要明确说明：
+You can also adjust the limit during a run:
 
 ```text
-Worker 必须以当前 working tree 为起点，而不是项目默认分支。
+Reduce the maximum active Workers from 8 to 3.
 ```
 
-## 3. 使用效果
+Lowering the limit does not interrupt Workers that are already running. It pauses new dispatches until the active count falls within the new limit.
 
-启动后，Codex 任务列表会形成一个可见的主控与 Worker 集合，例如：
+### Select the code baseline
+
+Code-writing Workers create isolated worktrees from the project default branch by default. If they must see current uncommitted changes, say so explicitly:
 
 ```text
-👑 [R7K2] 跟进 3 个 Worker｜完成发布准备
-├── ✍️ [R7K2-W1] 检查安装流程
-├── ⌛️ [R7K2-W2] 实现发布脚本｜等待主人确认目标环境
-└── ✅ [R7K2-W3] 审核安全边界
+Create Worker worktrees from the current working tree, not the project default branch.
 ```
 
-| 标记 | 含义 |
+### Conversation language
+
+The Skill selects the coordination language from the user's orchestration request:
+
+- English request: the Controller, Worker titles, progress, blockers, and synthesis run in English.
+- Chinese request: the entire coordination flow runs in Chinese.
+- Code, paths, quoted material, and the requested deliverable language do not affect detection.
+- A deliverable can use another language without changing the coordination language.
+- The coordination language changes during a run only when the user explicitly requests a switch.
+
+For example, an English request for a Chinese README keeps coordination in English while producing the README in Chinese.
+
+## 3. What You Will See
+
+After dispatch, the Codex task list forms a visible Controller and Worker group:
+
+```text
+👑 [R7K2] Tracking 3 Workers | Prepare the release
+├── ✍️ [R7K2-W1] Verify the installation flow
+├── ⌛️ [R7K2-W2] Implement the release script | Waiting for a target environment
+└── ✅ [R7K2-W3] Review safety boundaries
+```
+
+| Marker | Meaning |
 |---|---|
-| `👑` | 当前任务是唯一主控，负责决策、监控、验收和汇总 |
-| `✍️` | Worker 正在执行或等待主控验收 |
-| `⌛️` | Worker 因决策、澄清、权限、依赖或故障而阻塞 |
-| `✅` | Worker 已完成，并通过主控验收 |
+| `👑` | The current task is the single Controller responsible for decisions, monitoring, acceptance, and synthesis |
+| `✍️` | The Worker is running, revising, or waiting for Controller acceptance |
+| `⌛️` | The Worker is blocked by a decision, clarification, permission, dependency, or failure |
+| `✅` | The Worker is complete and has passed Controller acceptance |
 
-用户可以预期看到：
+You can expect:
 
-- 派发后立即收到 Worker 名称、目标、活跃数、排队数、并发上限和运行位置。
-- Worker 在接受任务、取得实质进展、发生阻塞和完成时通知主控。
-- 主控持续观察全部活跃 Worker，并及时汇报关键变化。
-- 需要用户决定时，受影响的 Worker 暂停，主控给出事实、选项和建议。
-- Worker 自称完成后，主控仍会独立检查证据；通过后才标记为 `✅`。
-- 写代码的 Worker 默认在相互隔离的 worktree 中工作，减少并发修改冲突。
-- 完成的任务保留在任务列表中，不会被自动归档。
+- An immediate dispatch report with Worker names, objectives, active and queued counts, concurrency limit, and execution location.
+- Worker messages when a task is accepted, reaches a substantive milestone, becomes blocked, or finishes.
+- Active monitoring by the Controller and timely reports of meaningful changes.
+- A paused affected Worker plus facts, options, and a recommendation when user input is required.
+- Independent Controller verification after a Worker reports `DONE`; `✅` appears only after acceptance.
+- Isolated worktrees for code-writing Workers by default, reducing concurrent-edit conflicts.
+- Completed tasks that remain visible and are never automatically archived.
 
-## 4. 使用原理
+## 4. How It Works
 
 ```mermaid
 flowchart TD
-    U["用户"] --> C["👑 主控任务"]
-    C --> P["拆解目标、依赖与文件边界"]
+    U["User"] --> C["👑 Controller task"]
+    C --> P["Select language and split goals, dependencies, and file boundaries"]
     P --> W1["✍️ Worker 1"]
     P --> W2["✍️ Worker 2"]
     P --> W3["✍️ Worker N"]
     W1 -->|"ACCEPTED / PROGRESS / DONE"| C
     W2 -->|"BLOCKED"| C
     W3 -->|"ACCEPTED / PROGRESS / DONE"| C
-    C -->|"需要主人决策"| U
-    C --> V["主控验收与成果整合"]
-    V --> R["组合验证与最终汇总"]
+    C -->|"User decision required"| U
+    C --> V["Controller acceptance and integration"]
+    V --> R["Combined validation and final synthesis"]
 ```
 
-核心流程如下：
+The core workflow is:
 
-1. **授权判断**：只有显式调用 Skill，或用户明确要求“独立任务并发”“主控 + Worker”等模式时，才允许创建 Worker。
-2. **拆解与寻址**：主控生成运行标识，将工作整理成带依赖关系的子任务，并取得自己的 `threadId`；跨主机时同时记录 `hostId`。
-3. **独立派发**：主控创建独立 Codex 任务，并把自己的地址、Worker 范围、禁止事项、文件边界和验收条件写入 Worker Prompt。
-4. **双向协调**：Worker 使用 `ACCEPTED`、`PROGRESS`、`BLOCKED` 和 `DONE` 消息主动回报；主控同时通过任务等待和读取能力主动观察。
-5. **阻塞决策**：Worker 不自行猜测产品、架构、权限或风险决策，而是暂停受影响工作并把选项发回主控。
-6. **验收与回收**：主控核对交付物和测试证据。代码成果按依赖顺序回收到本地，并完成组合验证。
-7. **完成但不归档**：通过验收的 Worker 标记为 `✅`；所有任务继续保留，最终结果由主控统一交付。
+1. **Authorization gate:** Workers are created only after explicit Skill invocation or a clear request for independent-task concurrency or a Controller + Worker workflow.
+2. **Language and addressing:** The Controller selects `runLanguage`, generates a run ID, and resolves its own `threadId`; cross-host runs also record `hostId`.
+3. **Decomposition and dispatch:** The Controller builds dependency-aware subtasks, selects the matching Worker Prompt language, and injects scope, prohibitions, file boundaries, and acceptance criteria.
+4. **Two-way coordination:** Workers send `ACCEPTED`, `PROGRESS`, `BLOCKED`, and `DONE`; the Controller also observes tasks through wait and read capabilities.
+5. **Blocker decisions:** Workers pause instead of guessing about product, architecture, permission, or risk decisions and send options back to the Controller.
+6. **Acceptance and integration:** The Controller checks deliverables and validation evidence. Code results are handed back in dependency order and validated together.
+7. **Completion without archiving:** Accepted Workers receive `✅`, all tasks remain visible, and the Controller delivers the final result.
 
-## 5. 安全边界与默认策略
+## 5. Safety Boundaries and Defaults
 
-| 项目 | 默认行为 |
+| Area | Default behavior |
 |---|---|
-| Worker 类型 | 独立 Codex 任务，不是子 Agent |
-| 决策中心 | 只有主控可以处理范围、冲突和最终验收 |
-| 最大活跃 Worker | 默认 8，用户可以在运行前或运行中调整 |
-| 代码写入 | 优先使用独立 worktree，并声明文件边界 |
-| 主机选择 | 本地主机优先，也支持明确的远程 `hostId` |
-| 提交与发布 | 不自动 commit、push、开 PR 或发布，除非原请求明确授权 |
-| 权限 | 不绕过审批、沙箱、凭据或外部写入限制 |
-| Worker 扩散 | Worker 不得创建子 Agent、其他任务或新的 Worker |
-| 完成标准 | Worker 的 `DONE` 必须经过主控验收 |
-| 自动归档 | 严禁；`✅` 只表示完成，不表示归档 |
+| Worker type | Independent Codex task, not a subagent |
+| Coordination language | Matches the user's orchestration request; English and Chinese are supported |
+| Decision authority | The Controller owns scope, conflicts, and final acceptance |
+| Maximum active Workers | 8 by default; adjustable before or during a run |
+| Code writes | Prefer isolated worktrees with explicit file boundaries |
+| Host selection | Prefer local execution; support an explicit remote `hostId` |
+| Commits and publishing | Do not commit, push, open PRs, or publish unless the original request authorizes it |
+| Permissions | Do not bypass approvals, sandboxes, credentials, or external-write restrictions |
+| Worker expansion | Workers may not create subagents, other tasks, or additional Workers |
+| Completion | A Worker `DONE` message requires Controller acceptance |
+| Automatic archiving | Prohibited; `✅` means complete, not archived |
 
-## 6. 运行要求与兼容性
+## 6. Runtime Requirements and Compatibility
 
-当前 Codex 表面需要提供：
+The active Codex surface must support:
 
-- 创建、列出、读取、等待和改名独立任务的能力。
-- 向其他任务发送消息的能力。
-- 项目与执行主机发现能力。
-- 对于代码任务，还需要 worktree 和 Handoff，或由用户明确认可其他成果回收方式。
+- Creating, listing, reading, waiting for, and renaming independent tasks.
+- Sending messages to another task.
+- Discovering projects and execution hosts.
+- For code-writing workflows, worktrees and Handoff, or another result-recovery method explicitly accepted by the user.
 
-如果预检发现关键能力不可用，Skill 会停止创建 Worker 并说明缺失项，不会假装已经进入编排模式。
+If a preflight check finds that a required capability is missing, the Skill stops before creating Workers and reports the missing capability instead of pretending orchestration is active.
 
-运行时暴露的工具名称和参数可能随 Codex 版本变化。Skill 会优先使用当前实际工具 schema，仓库中的工具契约用于说明预期能力和降级边界。
+Runtime tool names and schemas may change between Codex versions. The Skill uses the actual callable schema first; the bundled tool contract documents expected capabilities and safe fallback boundaries.
 
-## 7. 项目结构与进一步阅读
+## 7. Project Structure and Further Reading
 
 ```text
 .agents/
@@ -195,10 +211,12 @@ flowchart TD
         │   └── openai.yaml
         └── references/
             ├── protocol.md
-            └── tool-contracts.md
+            ├── tool-contracts.md
+            ├── worker-prompt.en.md
+            └── worker-prompt.zh-CN.md
 ```
 
-- [详细设计](DESIGN.md)
-- [Skill 主流程](.agents/skills/orchestrate-codex-tasks/SKILL.md)
-- [Controller/Worker 协议](.agents/skills/orchestrate-codex-tasks/references/protocol.md)
-- [独立任务工具契约](.agents/skills/orchestrate-codex-tasks/references/tool-contracts.md)
+- [Detailed design (Chinese)](DESIGN.md)
+- [Skill workflow](.agents/skills/orchestrate-codex-tasks/SKILL.md)
+- [Controller/Worker protocol](.agents/skills/orchestrate-codex-tasks/references/protocol.md)
+- [Independent-task tool contract](.agents/skills/orchestrate-codex-tasks/references/tool-contracts.md)

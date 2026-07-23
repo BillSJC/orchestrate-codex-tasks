@@ -3,105 +3,85 @@
 ## 目录
 
 1. 运行身份
-2. Worker Prompt 模板
-3. Worker 到主控的消息
-4. 主控到 Worker 的消息
-5. 标题和状态机
-6. 运行账本
-7. 并发调整
-8. 恢复与去重
+2. 运行语言
+3. Worker Prompt 模板
+4. Worker 到主控的消息
+5. 主控到 Worker 的消息
+6. 本地化标题和状态机
+7. 运行账本
+8. 并发调整
+9. 运行中切换语言
+10. 恢复与去重
 
 ## 1. 运行身份
 
 每次运行生成：
 
 - `runId`：短运行标识，例如 `R7K2`。
+- `runLanguage`：`en` 或 `zh-CN`。
 - `workerId`：稳定 Worker 标识，例如 `W1`。
 - `controllerThreadId`：主控真实任务 ID。
 - `controllerHostId`：跨主机时必填；同主机且工具不要求时可省略。
 
-主控必须把自己的真实 `threadId` 直接写入每个 Worker Prompt。Worker 不猜测、不搜索主控地址。
+主控必须把自己的真实 `threadId` 和 `runLanguage` 直接写入每个 Worker Prompt。Worker 不猜测、不搜索主控地址，也不自行选择初始协调语言。
 
-## 2. Worker Prompt 模板
+## 2. 运行语言
 
-把以下模板完整填充后作为 `create_thread` 的初始 `prompt`：
+在首次用户可见汇报、任务改名或 Worker 创建前解析 `runLanguage`：
 
-```text
-你是一个独立 Codex Worker 任务，不是 Codex 子 Agent。
-你由一个主控任务派发，只负责下面定义的单一子任务。
+1. 用户明确指定协调或会话语言时，以该指令为准。
+2. 否则判断触发本次编排的用户自然语言。
+3. 忽略代码、命令、路径、ID、引用材料和交付物的目标语言。
+4. 中文请求映射为 `zh-CN`，英文请求映射为 `en`。
+5. 中英文混合且仍然含糊时，使用最后一个有实际语义的用户自然语言句子；不要只为语言选择阻塞运行。
 
-协调地址
-- runId: {{RUN_ID}}
-- workerId: {{WORKER_ID}}
-- controllerThreadId: {{CONTROLLER_THREAD_ID}}
-- controllerHostId: {{CONTROLLER_HOST_ID_OR_OMIT}}
+`runLanguage` 控制：
 
-任务
-- 目标：{{OBJECTIVE}}
-- 背景与输入：{{CONTEXT}}
-- 允许范围：{{IN_SCOPE}}
-- 禁止范围：{{OUT_OF_SCOPE}}
-- 前置依赖：{{DEPENDENCIES}}
-- 执行主机：{{WORKER_HOST}}
-- 执行环境：{{LOCAL_OR_WORKTREE_OR_PROJECTLESS}}
-- worktree 起始状态：{{STARTING_STATE_OR_NOT_APPLICABLE}}
-- 文件写入边界：{{WRITE_BOUNDARY}}
-- 成果回收方式：{{INTEGRATION_PLAN}}
-- 期望交付物：{{DELIVERABLES}}
-- 验收与验证：{{ACCEPTANCE}}
+- 主控对用户的回复、进度、阻塞和最终汇总；
+- 主控与 Worker 标题中的人类可读文本；
+- Worker Prompt 和双向消息正文；
+- 决策、验收与残余风险说明。
 
-强制协作协议
-1. 这是主控拆出的独立子任务。不要创建子 Agent、其他 Codex 任务或新的 Worker。
-2. 不要自行改名、归档或移动本任务；标题和生命周期由主控管理。
-3. 如果 send_message_to_thread 未直接加载，先使用工具搜索发现它。
-4. 开始后立即向主控发送 ACCEPTED，说明你理解的目标、计划和首个里程碑。
-5. 遇到以下任一情况时不得自行猜测：
-   - 需要产品、业务、架构或用户偏好决策；
-   - 需求互相冲突或缺少关键输入；
-   - 需要扩大权限、文件边界或外部影响；
-   - 缺少依赖、环境或凭据；
-   - 继续执行可能造成不可逆或高风险结果。
-6. 发生阻塞时：
-   - 暂停受影响的动作；
-   - 使用 send_message_to_thread 向 controllerThreadId 发送 BLOCKED；
-   - 提供原因、已确认事实、选项、推荐方案和不决策的影响；
-   - 等待主控回复。只继续与阻塞无关且明确安全的工作。
-7. 有实质性里程碑时发送 PROGRESS；不要发送无信息量心跳。
-8. 完成时先发送 DONE，包含结果、证据、验证、文件或链接和残余风险，然后再结束本任务。
-9. 主控负责最终决策和验收。不要向主人宣称总体工作已完成。
+以下内容不本地化：
 
-代码写入规则
-- 只修改“文件写入边界”允许的路径。
-- 默认在独立 worktree 中实现和测试。
-- 不自行 Handoff 到 Local。
-- 不提交、推送、开 PR 或发布，除非本 Prompt 明确授权。
-- DONE 必须附 git status --short、变更文件清单、测试命令和结果。
+- 协议枚举和命令；
+- 结构化字段名；
+- 工具名和参数名；
+- `runId`、`workerId`、`threadId`、`hostId`；
+- 路径、命令、代码和用户提供的专有名称。
 
-消息调用
-send_message_to_thread({
-  "threadId": "{{CONTROLLER_THREAD_ID}}",
-  "hostId": "{{CONTROLLER_HOST_ID_OR_OMIT}}",
-  "prompt": "<按下列 Worker 消息格式填写>"
-})
+交付物语言独立于 `runLanguage`。例如，中文请求要求生成英文 README 时，协调语言仍为中文，README 使用英文。
 
-如果 send_message_to_thread 不可用，在最终输出开头写 BLOCKED，说明无法满足协调协议，并停止需要主控决策的工作。
-```
+## 3. Worker Prompt 模板
 
-若同一主机且 `hostId` 可省略，删除整个 `hostId` 字段，不传空字符串。
+按 `runLanguage` 只读取并使用一份模板：
 
-## 3. Worker 到主控的消息
+- `en`：[worker-prompt.en.md](worker-prompt.en.md)
+- `zh-CN`：[worker-prompt.zh-CN.md](worker-prompt.zh-CN.md)
+
+派发规则：
+
+1. 完整读取匹配语言的模板。
+2. 填充所有占位符，并让任务目标、范围、边界和验收说明使用 `runLanguage`；路径、命令、代码和交付物要求保持原样。
+3. 不临时翻译另一份模板，也不把两种模板混合进同一个 Worker Prompt。
+4. 将填充后的模板正文作为 `create_thread` 初始 `prompt`。
+5. 同一主机且 `hostId` 可省略时，删除整个 `controllerHostId` 行和消息调用中的整个 `hostId` 字段，不传空字符串。
+
+## 4. Worker 到主控的消息
+
+结构化字段保持英文，字段内容使用当前 `runLanguage`：
 
 ```text
 [ORCH run={{RUN_ID}} worker={{WORKER_ID}} seq={{SEQ}} type={{TYPE}}]
-summary: <一句话状态>
+summary: <one-line status in runLanguage>
 details:
-- <关键事实或产出>
+- <key fact or result in runLanguage>
 next:
-- <下一步；DONE 时写 none>
+- <next action in runLanguage; use none for DONE>
 needs:
-- <需要主控决定的事项；无则写 none>
+- <Controller decision needed in runLanguage; use none when not needed>
 evidence:
-- <文件、命令、测试、链接或其他证据>
+- <file, command, test, link, or other evidence>
 ```
 
 `TYPE` 只能是：
@@ -113,50 +93,51 @@ evidence:
 
 `seq` 从 `001` 开始单调增加。每个消息只表达一个主要状态变化。
 
-### 3.1 BLOCKED 最低内容
+### 4.1 BLOCKED 最低内容
 
 ```text
-summary: <阻塞点>
+summary: <blocker in runLanguage>
 details:
-- facts: <已经确认的事实>
-- cause: <为什么无法继续>
+- facts: <confirmed facts in runLanguage>
+- cause: <why work cannot continue in runLanguage>
 next:
-- option-a: <方案和影响>
-- option-b: <方案和影响>
+- option-a: <option and impact in runLanguage>
+- option-b: <option and impact in runLanguage>
 needs:
-- recommendation: <Worker 推荐>
-- decision: <主控必须决定什么>
+- recommendation: <Worker recommendation in runLanguage>
+- decision: <decision required from the Controller in runLanguage>
 evidence:
-- <相关文件、错误或工具结果>
+- <relevant file, error, or tool result>
 ```
 
-### 3.2 DONE 最低内容
+### 4.2 DONE 最低内容
 
 ```text
-summary: <完成了什么>
+summary: <completed result in runLanguage>
 details:
-- deliverables: <交付物>
-- changed-files: <文件清单或 none>
-- residual-risks: <残余风险或 none>
+- deliverables: <deliverables>
+- changed-files: <file list or none>
+- residual-risks: <residual risks in runLanguage or none>
 next:
 - none
 needs:
 - none
 evidence:
-- commands: <验证命令>
-- results: <验证结果>
-- git-status: <git status --short 或 not-applicable>
+- commands: <validation commands>
+- results: <validation results in runLanguage>
+- git-status: <git status --short or not-applicable>
 ```
 
-## 4. 主控到 Worker 的消息
+## 5. 主控到 Worker 的消息
 
 ```text
 [ORCH run={{RUN_ID}} worker={{WORKER_ID}} controllerSeq={{SEQ}} command={{COMMAND}}]
-decision: <主控决定或 none>
+language: {{RUN_LANGUAGE}}
+decision: <Controller decision in runLanguage or none>
 instructions:
-- <下一步>
+- <next action in runLanguage>
 acceptanceDelta:
-- <验收条件变化；无则 none>
+- <acceptance change in runLanguage or none>
 ```
 
 `COMMAND` 只能是：
@@ -164,25 +145,52 @@ acceptanceDelta:
 - `DECISION`：回答阻塞问题。
 - `REVISION`：验收失败，要求在原范围内修订。
 - `SCOPE_UPDATE`：用户已经授权范围变化。
+- `LANGUAGE_UPDATE`：用户明确要求切换协调语言。
 - `STOP`：用户明确停止，或原任务已失去价值。
 
-主控不能用 `SCOPE_UPDATE` 自行扩大用户授权。
+主控不能用 `SCOPE_UPDATE` 自行扩大用户授权，也不能把交付物语言变化误写成 `LANGUAGE_UPDATE`。
 
-## 5. 标题和状态机
+## 6. 本地化标题和状态机
 
-### 5.1 主控标题
+### 6.1 英文主控标题
+
+以下五行依次对应 `PLANNING`、`TRACKING`、`WAITING_FOR_USER`、`SYNTHESIZING` 和 `COMPLETE`：
+
+```text
+👑 [<runId>] Planning | <overall goal>
+👑 [<runId>] Tracking <N> Workers | <overall goal>
+👑 [<runId>] Waiting for user decision | <overall goal>
+👑 [<runId>] Synthesizing | <overall goal>
+👑 [<runId>] Complete | <overall goal>
+```
+
+### 6.2 中文主控标题
+
+以下五行依次对应 `PLANNING`、`TRACKING`、`WAITING_FOR_USER`、`SYNTHESIZING` 和 `COMPLETE`：
 
 ```text
 👑 [<runId>] 拆解｜<总体目标>
 👑 [<runId>] 跟进 <N> 个 Worker｜<总体目标>
-👑 [<runId>] 等待主人确认｜<总体目标>
+👑 [<runId>] 等待用户确认｜<总体目标>
 👑 [<runId>] 汇总｜<总体目标>
 👑 [<runId>] 完成｜<总体目标>
 ```
 
-`👑` 必须是第一个字符。
+`👑` 必须是第一个字符。目标摘要使用 `runLanguage`，但路径、命令和专有名称保持原样。
 
-### 5.2 Worker 标题
+### 6.3 英文 Worker 标题
+
+以下三行依次对应 `RUNNING`、`BLOCKED` 和 `DONE`：
+
+```text
+✍️ [<runId>-<workerId>] <action phrase>
+⌛️ [<runId>-<workerId>] <action phrase> | <blocker summary>
+✅ [<runId>-<workerId>] <action phrase>
+```
+
+### 6.4 中文 Worker 标题
+
+以下三行依次对应 `RUNNING`、`BLOCKED` 和 `DONE`：
 
 ```text
 ✍️ [<runId>-<workerId>] <动宾短语>
@@ -192,7 +200,7 @@ acceptanceDelta:
 
 图标必须是第一个字符。Worker 不自行改名。
 
-### 5.3 状态映射
+### 6.5 状态映射
 
 | 状态 | 标题前缀 | 含义 |
 |---|---|---|
@@ -218,7 +226,7 @@ RUNNING/BLOCKED -> STOPPED
 
 Worker 自称 `DONE` 只触发 `VALIDATING`。只有主控验收后才能进入 `DONE` 和 `✅`。
 
-## 6. 运行账本
+## 7. 运行账本
 
 每个 Worker 保存：
 
@@ -245,6 +253,7 @@ Worker 自称 `DONE` 只触发 `VALIDATING`。只有主控验收后才能进入 
 | 字段 | 含义 |
 |---|---|
 | `runId` | 运行标识 |
+| `runLanguage` | `en` 或 `zh-CN` |
 | `controllerThreadId` | 主控 ID |
 | `controllerHostId` | 主控主机 |
 | `maxActiveWorkers` | 默认 8，用户可调 |
@@ -253,7 +262,7 @@ Worker 自称 `DONE` 只触发 `VALIDATING`。只有主控验收后才能进入 
 | `monitorGroups` | 每组最多 8 个 Worker |
 | `localPreferred` | 默认 `true` |
 
-## 7. 并发调整
+## 8. 并发调整
 
 解析：
 
@@ -268,15 +277,28 @@ effective = min(requested, 值得独立派发且已就绪的任务数, 当前环
 - 降低时不自动停止现有 Worker，只暂停新派发。
 - 大于 8 时重建监控分组。
 - 非正整数、含糊范围或环境不支持时请求修正或报告可执行值。
-- 每次改变都报告旧值、新值、活跃数和排队数。
+- 每次改变都使用 `runLanguage` 报告旧值、新值、活跃数和排队数。
 
-## 8. 恢复与去重
+## 9. 运行中切换语言
+
+初始 `runLanguage` 在本次运行中保持稳定。普通术语切换、代码、引用材料或交付物语言变化都不触发协调语言切换。
+
+只有用户明确要求切换会话或协调语言时：
+
+1. 更新运行账本中的 `runLanguage`。
+2. 立即用新语言回复用户，并更新主控标题。
+3. 向所有活跃 Worker 发送 `LANGUAGE_UPDATE`，其中 `language` 为新值。
+4. Worker 从下一条消息开始使用新语言，不重写历史消息。
+5. 新创建的 Worker 使用新语言对应的完整 Worker Prompt。
+
+## 10. 恢复与去重
 
 1. 用 `runId` 搜索标题。
 2. 列出任务并匹配 `runId-workerId`。
-3. 读取近期任务状态。
-4. 只接受比 `lastSeq` 更新的 Worker 消息。
-5. `DONE` 后的旧 `PROGRESS` 不回退状态。
-6. `REVISION` 保持相同 Worker ID，消息序号继续增加。
-7. 不因上下文丢失重复创建 Worker。
-8. 不因恢复、失败或停止而自动归档任何任务。
+3. 从运行账本恢复 `runLanguage`；账本缺失时，从主控标题和最近一条实质性用户请求恢复。
+4. 读取近期任务状态。
+5. 只接受比 `lastSeq` 更新的 Worker 消息。
+6. `DONE` 后的旧 `PROGRESS` 不回退状态。
+7. `REVISION` 保持相同 Worker ID，消息序号继续增加。
+8. 不因上下文丢失重复创建 Worker。
+9. 不因恢复、失败或停止而自动归档任何任务。

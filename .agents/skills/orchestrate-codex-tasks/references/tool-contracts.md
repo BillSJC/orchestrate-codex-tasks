@@ -58,7 +58,7 @@
 如果运行时没有直接提供：
 
 1. 生成本次唯一 `runId`。
-2. 给当前任务设置包含该 `runId` 的 `👑` 标题；给当前任务改名时省略 `threadId`。
+2. 先按 protocol reference 确定 `runLanguage`，再给当前任务设置包含该 `runId` 的本地化 `👑` 标题；给当前任务改名时省略 `threadId`。
 3. 使用 `list_threads` 搜索该 `runId`。
 4. 只接受与当前项目、标题和运行状态一致的唯一匹配。
 5. 从匹配结果记录主控 `threadId` 和 `hostId`。
@@ -73,7 +73,7 @@
 
 ```text
 create_thread({
-  "prompt": "<完整 Worker Prompt>",
+  "prompt": "<匹配 runLanguage 的完整 Worker Prompt>",
   "target": {
     "type": "project",
     "projectId": "<PROJECT_ID>",
@@ -88,7 +88,7 @@ create_thread({
 
 ```text
 create_thread({
-  "prompt": "<完整 Worker Prompt>",
+  "prompt": "<匹配 runLanguage 的完整 Worker Prompt>",
   "target": {
     "type": "project",
     "projectId": "<PROJECT_ID>",
@@ -103,7 +103,7 @@ create_thread({
 
 ```text
 create_thread({
-  "prompt": "<完整 Worker Prompt>",
+  "prompt": "<匹配 runLanguage 的完整 Worker Prompt>",
   "target": {
     "type": "projectless",
     "directoryName": "<可选目录名>"
@@ -121,7 +121,7 @@ create_thread({
 
 ```text
 set_thread_title({
-  "title": "👑 [R7K2] 拆解｜总体目标"
+  "title": "👑 [R7K2] <匹配 runLanguage 的 PLANNING 标题>"
 })
 ```
 
@@ -130,7 +130,7 @@ Worker 改名时使用真实 `threadId`：
 ```text
 set_thread_title({
   "threadId": "<WORKER_THREAD_ID>",
-  "title": "✍️ [R7K2-W1] 实现解析器"
+  "title": "✍️ [R7K2-W1] <匹配 runLanguage 的动作短语>"
 })
 ```
 

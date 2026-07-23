@@ -53,6 +53,21 @@
 - 不创建无上限 Worker；使用有限并发和波次调度。
 - 不自动归档任何主控或 Worker 任务。
 
+### 2.3 I18N 与运行语言
+
+每次运行在首次用户可见动作前确定 `runLanguage`：
+
+- 用户明确指定会话或协调语言时，以该指令为准。
+- 否则根据触发编排的用户自然语言选择：英文为 `en`，中文为 `zh-CN`。
+- 代码、路径、命令、引用材料和交付物目标语言不参与判断。
+- 中英文混合且仍然含糊时，使用最后一个有实际语义的用户自然语言句子。
+- `runLanguage` 写入运行账本，并传入每个 Worker Prompt。
+- 用户运行中明确要求切换语言时，主控更新账本并向所有活跃 Worker 发送 `LANGUAGE_UPDATE`。
+
+`runLanguage` 控制主控回复、任务标题、Worker Prompt、进度、阻塞、验收和最终汇总。协议枚举、字段名、工具名、ID、路径、命令和代码不翻译。交付物语言独立于协调语言，例如中文请求生成英文 README 时，协调仍使用中文。
+
+Codex Skill 没有用于控制模型响应语言的 `agents/openai.yaml` 字段；IDE 的 `chatgpt.localeOverride` 也只控制 UI。因此该能力必须由 Skill 指令和 Worker Prompt 协议实现，而不是依赖界面 locale。
+
 ## 3. 官方依据与当前工具映射
 
 OpenAI 官方 Codex App Server 文档定义了线程和轮次的底层生命周期：
@@ -969,14 +984,17 @@ acceptanceDelta:
         ├── agents/
         │   └── openai.yaml
         └── references/
+            ├── protocol.md
             ├── tool-contracts.md
-            └── protocol.md
+            ├── worker-prompt.en.md
+            └── worker-prompt.zh-CN.md
 ```
 
 职责：
 
 - `SKILL.md`
   - 三档触发判断：执行、只建议、不触发。
+  - `runLanguage` 选择、传播和切换。
   - 独立任务创建授权检查。
   - 主控六阶段调度算法。
   - 并发、写入和验收守则。
@@ -990,10 +1008,15 @@ acceptanceDelta:
   - 默认 8 并发及大于 8 时的监控分组。
   - 工具缺失和返回值边界。
 - `references/protocol.md`
-  - Worker Prompt 模板。
+  - 双语 Prompt 的选择规则。
   - 状态消息格式。
-  - 标题状态机。
+  - 英文和中文标题状态机。
+  - `LANGUAGE_UPDATE`。
   - 恢复和去重规则。
+- `references/worker-prompt.en.md`
+  - `runLanguage=en` 时使用的完整英文 Worker Prompt。
+- `references/worker-prompt.zh-CN.md`
+  - `runLanguage=zh-CN` 时使用的完整中文 Worker Prompt。
 - `agents/openai.yaml`
   - UI 名称和默认 Prompt。
   - `allow_implicit_invocation: true`，依靠严格 `description` 识别强意图。
@@ -1010,7 +1033,7 @@ acceptanceDelta:
 interface:
   display_name: "Codex Task Orchestrator"
   short_description: "Coordinate independent Codex tasks as Controller and Workers"
-  default_prompt: "Use $orchestrate-codex-tasks to split this request into independent Codex Worker tasks, coordinate them, and synthesize the result."
+  default_prompt: "Use $orchestrate-codex-tasks to split this request into independent Codex Worker tasks, coordinate them, and synthesize the result in the language of the user's orchestration request."
 
 policy:
   allow_implicit_invocation: true
@@ -1025,6 +1048,7 @@ policy:
 ```text
 <repo>/
 ├── README.md
+├── README.zh-CN.md
 ├── DESIGN.md
 └── .agents/
     └── skills/
@@ -1033,8 +1057,10 @@ policy:
             ├── agents/
             │   └── openai.yaml
             └── references/
+                ├── protocol.md
                 ├── tool-contracts.md
-                └── protocol.md
+                ├── worker-prompt.en.md
+                └── worker-prompt.zh-CN.md
 ```
 
 上传 GitHub 后，Skill 的稳定路径为：
@@ -1208,6 +1234,20 @@ $HOME/.agents/skills/orchestrate-codex-tasks/
 - Worker 完成后先 Handoff 到本地匹配项目 worktree，再串行回收到 Local。
 - 任一步骤失败时标记 `⌛️` 并报告，不用远程 push 绕过确认。
 
+### 场景 15：英文编排
+
+- 用户用英文明确调用 Skill。
+- `runLanguage=en`。
+- 主控汇报、任务标题、英文 Worker Prompt、阻塞选项、验收和最终汇总全部使用英文。
+- `ACCEPTED/PROGRESS/BLOCKED/DONE`、字段名、路径、命令和代码保持原样。
+
+### 场景 16：中文编排生成英文交付物
+
+- 用户用中文要求并发生成英文 README。
+- `runLanguage=zh-CN`，主控和 Worker 的协调内容使用中文。
+- README 交付物使用英文，不触发协调语言切换。
+- 只有用户明确要求“后续请用英文协调”时，主控才发送 `LANGUAGE_UPDATE`。
+
 ## 16. 完成标准
 
 Skill 实现完成后，应满足：
@@ -1215,7 +1255,10 @@ Skill 实现完成后，应满足：
 - 所有 Worker 都是 `create_thread` 创建的独立任务。
 - 不出现 `spawn_agent` 或 Worker 自扩散。
 - 每个 Worker Prompt 都包含主控 `threadId`。
+- 每个 Worker Prompt 都包含正确的 `runLanguage`，并使用对应的完整语言模板。
 - 跨主机 Worker 同时获得主控 `hostId`。
+- 英文请求的主控回复、标题、Worker 消息和汇总使用英文；中文请求对应使用中文。
+- 交付物语言不反向改变协调语言；显式语言切换能够传播到所有活跃 Worker。
 - 每个任务标题始终符合图标状态规则。
 - 每个阻塞都能进入主控并被用户看见。
 - 主控同时使用 Worker 消息和主动监控。
@@ -1236,6 +1279,8 @@ Skill 实现完成后，应满足：
 | Skill 名称 | `orchestrate-codex-tasks` |
 | 激活方式 | 显式调用，或强意图自然语言隐式识别 |
 | 隐式调用 | 启用，但 `description` 仅匹配明确创建独立任务的意图 |
+| 协调语言 | 根据用户编排请求选择 `en` 或 `zh-CN` |
+| 语言切换 | 运行期间仅响应用户明确要求，并向活跃 Worker 发送 `LANGUAGE_UPDATE` |
 | 最大活跃 Worker | 8；用户可按本次运行主动调整 |
 | Worker 是否可再派生 | 否 |
 | 写代码 Worker 环境 | 独立 `worktree` |
@@ -1262,6 +1307,7 @@ Skill 实现完成后，应满足：
 4. 支持远程 `hostId`，但默认优先本地主机。
 5. `maxActiveWorkers` 默认 8，用户可以在运行前或运行中主动调整。
 6. Worker 完成后使用 `✅`，但永不自动归档。
+7. 英文请求使用英文协调，中文请求使用中文协调；交付物语言与协调语言独立。
 
 当前没有阻塞第一版建设的待确认项。运行时出现的基线选择、远程项目歧义、额外权限或成果回收冲突，均由 Skill 的预检和 `BLOCKED` 协议处理，不需要在设计阶段预先猜测。
 
@@ -1275,17 +1321,20 @@ Skill 实现完成后，应满足：
    - 正文保留预检、六阶段调度、8 并发默认值、worktree 优先、本地优先、阻塞汇报和禁止归档等核心规则；
    - 正文控制在 500 行以内。
 3. 将详细工具契约、Handoff、远程主机和异常恢复放入 `references/tool-contracts.md`。
-4. 将 Worker Prompt、双向消息格式、状态机和标题规则放入 `references/protocol.md`。
-5. 依据最终 Skill 内容生成 `agents/openai.yaml`，启用严格描述驱动的隐式选择。
-6. 运行官方 `quick_validate.py`。
-7. 执行静态审计：
+4. 将双向消息格式、双语标题状态机、语言切换和恢复规则放入 `references/protocol.md`。
+5. 将完整 Worker Prompt 分别放入 `references/worker-prompt.en.md` 和 `references/worker-prompt.zh-CN.md`，运行时只读取匹配 `runLanguage` 的一份。
+6. 依据最终 Skill 内容生成 `agents/openai.yaml`，启用严格描述驱动的隐式选择。
+7. 运行官方 `quick_validate.py`。
+8. 执行静态审计：
    - 全仓只使用 `Prompt` 术语；
    - 默认并发值必须为 8；
    - 不出现 `spawn_agent` 调度路径；
    - 不出现任何肯定式归档调用指令；归档工具只能出现在禁止规则中；
    - 写代码默认环境必须为 `worktree`；
    - 每个 Worker Prompt 必须要求回传主控并包含主控 `threadId`。
-8. 对第 15 节场景做无副作用的结构化演练。
-9. 只有用户明确要求进行真实端到端测试时，才实际创建独立 Worker 任务；测试完成后同样只标记 `✅`，不归档。
+   - 英文和中文 Worker Prompt 必须包含相同的协议枚举、安全边界和消息字段。
+   - README.md 与 README.zh-CN.md 必须互相链接。
+9. 对第 15 节场景做无副作用的结构化演练。
+10. 只有用户明确要求进行真实端到端测试时，才实际创建独立 Worker 任务；测试完成后同样只标记 `✅`，不归档。
 
 以上步骤完成并通过校验后，第一版即可发布到 GitHub 并通过 `$skill-installer` 安装。
