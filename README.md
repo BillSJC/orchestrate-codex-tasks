@@ -23,10 +23,8 @@ Worker 是独立 Codex 任务，不是 Codex 子 Agent。
 
 ```text
 请使用 $skill-installer，从下面的 GitHub 地址安装这个 Skill：
-https://github.com/<OWNER>/<REPO>/tree/main/.agents/skills/orchestrate-codex-tasks
+https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/orchestrate-codex-tasks
 ```
-
-把 `<OWNER>` 和 `<REPO>` 替换为实际 GitHub 仓库。
 
 如果安装后没有立即出现，重启 Codex 后再检查。
 

@@ -1040,7 +1040,7 @@ policy:
 上传 GitHub 后，Skill 的稳定路径为：
 
 ```text
-https://github.com/<OWNER>/<REPO>/tree/main/.agents/skills/orchestrate-codex-tasks
+https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/orchestrate-codex-tasks
 ```
 
 ### 14.2 推荐安装方式：让 Codex 使用 `$skill-installer`
@@ -1049,14 +1049,14 @@ https://github.com/<OWNER>/<REPO>/tree/main/.agents/skills/orchestrate-codex-tas
 
 ```text
 Use $skill-installer to install the skill from
-https://github.com/<OWNER>/<REPO>/tree/main/.agents/skills/orchestrate-codex-tasks
+https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/orchestrate-codex-tasks
 ```
 
 也可以用中文：
 
 ```text
 请使用 $skill-installer，从下面的 GitHub 地址安装这个 Skill：
-https://github.com/<OWNER>/<REPO>/tree/main/.agents/skills/orchestrate-codex-tasks
+https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/orchestrate-codex-tasks
 ```
 
 当前内置安装器会：
