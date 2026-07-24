@@ -24,8 +24,10 @@ from orchestration_common import (  # noqa: E402
     OrchestrationError,
     boundaries_overlap,
     canonical_json,
+    configure_utf8_stdio,
     load_json_file,
     normalize_boundary,
+    normalize_execution_plan,
     print_result,
     require_string_list,
     require_text,
@@ -64,6 +66,8 @@ COMMANDS = {
     "LANGUAGE_UPDATE",
     "STOP",
 }
+MICRO_CONTROL_COMMANDS = {"DECISION", "REVISION"}
+MAX_DECISION_ROUND_TRIPS = 3
 ALLOWED_TRANSITIONS = {
     "PROVISIONING": {"PROVISIONING", "RUNNING", "BLOCKED", "RETIRED"},
     "RUNNING": {"RUNNING", "BLOCKED", "REVIEW", "RETIRED"},
@@ -213,6 +217,8 @@ TASK_SPEC_FIELDS = {
     "acceptance",
     "milestones",
     "healthCheckpoint",
+    "coordinationProfile",
+    "resourceClaims",
 }
 
 
@@ -734,6 +740,35 @@ def task_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     priority = task.get("priority", 100)
     if not isinstance(priority, int) or isinstance(priority, bool):
         raise OrchestrationError("INVALID_FIELD", "priority must be an integer")
+    coordination_profile = task.get("coordinationProfile")
+    if coordination_profile is not None and coordination_profile not in {
+        "lean",
+        "standard",
+        "strict",
+    }:
+        raise OrchestrationError(
+            "INVALID_FIELD",
+            "coordinationProfile must be lean, standard, or strict",
+        )
+    resource_claims = task.get("resourceClaims")
+    if resource_claims is not None:
+        if not isinstance(resource_claims, dict) or not 1 <= len(resource_claims) <= 32:
+            raise OrchestrationError(
+                "INVALID_FIELD",
+                "resourceClaims must contain between 1 and 32 resources",
+            )
+        for resource, quantity in resource_claims.items():
+            if (
+                not isinstance(resource, str)
+                or re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,31}", resource) is None
+                or not isinstance(quantity, int)
+                or isinstance(quantity, bool)
+                or quantity <= 0
+            ):
+                raise OrchestrationError(
+                    "INVALID_FIELD",
+                    "resourceClaims must map valid names to positive integers",
+                )
     validate_safe_data(task)
     normalized_task = dict(task)
     normalized_task.update(
@@ -2290,6 +2325,7 @@ def normalize_operation_request(
                 "decision",
                 "instructions",
                 "acceptanceDelta",
+                "executionPlan",
             },
             field="SEND_MESSAGE request",
         )
@@ -2309,6 +2345,15 @@ def normalize_operation_request(
                     field,
                     minimum=1,
                 )
+        if normalized.get("executionPlan") is not None:
+            if command != "REPLAN":
+                raise OrchestrationError(
+                    "INVALID_FIELD",
+                    "executionPlan is allowed only for REPLAN",
+                )
+            normalized["executionPlan"] = normalize_execution_plan(
+                normalized["executionPlan"]
+            )
     elif kind == "SET_TITLE":
         reject_unknown_fields(
             normalized,
@@ -2602,6 +2647,40 @@ def command_intent(args: argparse.Namespace) -> dict[str, Any]:
                         "WORKER_TERMINAL",
                         "Cannot send orchestration commands to a terminal Worker",
                     )
+                command = request["command"]
+                decision_round_trips = int(worker["decision_round_trips"])
+                if (
+                    command in MICRO_CONTROL_COMMANDS
+                    and decision_round_trips >= MAX_DECISION_ROUND_TRIPS
+                ):
+                    raise OrchestrationError(
+                        "EFFICIENCY_REVIEW_REQUIRED",
+                        (
+                            "Three successful micro-control round trips require "
+                            "CHECKPOINT, bounded REPLAN, or STOP before another "
+                            "DECISION/REVISION"
+                        ),
+                        {
+                            "workerId": worker_id,
+                            "decisionRoundTrips": decision_round_trips,
+                        },
+                    )
+                if (
+                    command == "REPLAN"
+                    and decision_round_trips >= MAX_DECISION_ROUND_TRIPS
+                    and request.get("executionPlan") is None
+                ):
+                    raise OrchestrationError(
+                        "EFFICIENCY_REVIEW_REQUIRED",
+                        (
+                            "REPLAN must include a bounded executionPlan after "
+                            "three micro-control round trips"
+                        ),
+                        {
+                            "workerId": worker_id,
+                            "decisionRoundTrips": decision_round_trips,
+                        },
+                    )
                 controller_seq = int(worker["last_controller_seq_reserved"]) + 1
                 connection.execute(
                     """
@@ -2874,6 +2953,42 @@ def command_outcome(args: argparse.Namespace) -> dict[str, Any]:
                             """,
                             (response.get("summary", "create_thread failed"), now, worker_id),
                         )
+
+            elif kind == "SEND_MESSAGE" and status == "SUCCEEDED":
+                command = request["command"]
+                if command in MICRO_CONTROL_COMMANDS:
+                    connection.execute(
+                        """
+                        UPDATE workers
+                        SET decision_round_trips = decision_round_trips + 1,
+                            health = CASE
+                                WHEN health = 'STALLED' THEN health
+                                WHEN decision_round_trips + 1 >= ? THEN 'AT_RISK'
+                                ELSE health
+                            END,
+                            updated_at = ?
+                        WHERE worker_id = ?
+                        """,
+                        (MAX_DECISION_ROUND_TRIPS, now, worker_id),
+                    )
+                elif command == "REPLAN" and request.get("executionPlan") is not None:
+                    connection.execute(
+                        """
+                        UPDATE workers
+                        SET decision_round_trips = 0,
+                            health = CASE
+                                WHEN health = 'STALLED' THEN health
+                                WHEN progress_without_completion >= 3
+                                  OR scope_delta_count > 0
+                                  OR timeout_count > 0
+                                THEN 'AT_RISK'
+                                ELSE 'HEALTHY'
+                            END,
+                            updated_at = ?
+                        WHERE worker_id = ?
+                        """,
+                        (now, worker_id),
+                    )
 
             elif kind == "SET_TITLE" and status == "SUCCEEDED":
                 title = request.get("title")
@@ -3210,29 +3325,30 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
     return result(True, "LEDGER_STATUS", databasePath=str(Path(args.db).resolve()), **status)
 
 
+def build_pending_operations(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    check_schema(connection)
+    rows = connection.execute(
+        """
+        SELECT operation_id, request_id, kind, worker_id, status, controller_seq,
+               request_json, created_at, updated_at
+        FROM operations
+        WHERE status IN ('INTENT', 'UNKNOWN')
+        ORDER BY created_at, operation_id
+        """
+    ).fetchall()
+    return [
+        {
+            **{key: row[key] for key in row.keys() if key != "request_json"},
+            "request": decode_json(row["request_json"], {}),
+        }
+        for row in rows
+    ]
+
+
 def command_pending(args: argparse.Namespace) -> dict[str, Any]:
     with connect_database(Path(args.db), readonly=True) as connection:
-        check_schema(connection)
-        rows = connection.execute(
-            """
-            SELECT operation_id, request_id, kind, worker_id, status, controller_seq,
-                   request_json, created_at, updated_at
-            FROM operations
-            WHERE status IN ('INTENT', 'UNKNOWN')
-            ORDER BY created_at, operation_id
-            """
-        ).fetchall()
-    return result(
-        True,
-        "PENDING_OPERATIONS",
-        operations=[
-            {
-                **{key: row[key] for key in row.keys() if key != "request_json"},
-                "request": decode_json(row["request_json"], {}),
-            }
-            for row in rows
-        ],
-    )
+        operations = build_pending_operations(connection)
+    return result(True, "PENDING_OPERATIONS", operations=operations)
 
 
 def command_manifest(args: argparse.Namespace) -> dict[str, Any]:
@@ -3594,6 +3710,38 @@ def command_verify(args: argparse.Namespace) -> dict[str, Any]:
     return result(True, "LEDGER_VALID", **verification)
 
 
+def command_snapshot(args: argparse.Namespace) -> dict[str, Any]:
+    if (
+        not isinstance(args.terminal_limit, int)
+        or isinstance(args.terminal_limit, bool)
+        or args.terminal_limit < 0
+    ):
+        raise OrchestrationError(
+            "INVALID_FIELD",
+            "terminal-limit must be a non-negative integer",
+        )
+    database_path = Path(args.db)
+    with connect_database(database_path, readonly=True) as connection:
+        connection.execute("BEGIN")
+        verification = verify_connection(connection)
+        if not verification["valid"]:
+            raise OrchestrationError(
+                "LEDGER_INVALID",
+                "Ledger verification failed",
+                verification,
+            )
+        status = build_status(connection, terminal_limit=args.terminal_limit)
+        operations = build_pending_operations(connection)
+    return result(
+        True,
+        "RECOVERY_SNAPSHOT",
+        databasePath=str(database_path.resolve()),
+        verification=verification,
+        status=status,
+        pendingOperations=operations,
+    )
+
+
 def command_export(args: argparse.Namespace) -> dict[str, Any]:
     with connect_database(Path(args.db), readonly=True) as connection:
         exported = build_status(connection, terminal_limit=None, include_events=True)
@@ -3853,7 +4001,7 @@ def build_parser() -> argparse.ArgumentParser:
     outcome_parser.add_argument("--response-file")
     outcome_parser.set_defaults(handler=command_outcome)
 
-    status_parser = subparsers.add_parser("status", help="Read a bounded recovery snapshot")
+    status_parser = subparsers.add_parser("status", help="Read bounded ledger status")
     status_parser.add_argument("--db", required=True)
     status_parser.add_argument("--terminal-limit", type=int, default=20)
     status_parser.set_defaults(handler=command_status)
@@ -3874,6 +4022,14 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser = subparsers.add_parser("verify", help="Validate ledger integrity and invariants")
     verify_parser.add_argument("--db", required=True)
     verify_parser.set_defaults(handler=command_verify)
+
+    snapshot_parser = subparsers.add_parser(
+        "snapshot",
+        help="Read verification, bounded status, and pending operations atomically",
+    )
+    snapshot_parser.add_argument("--db", required=True)
+    snapshot_parser.add_argument("--terminal-limit", type=int, default=20)
+    snapshot_parser.set_defaults(handler=command_snapshot)
 
     export_parser = subparsers.add_parser("export", help="Export a sanitized full JSON snapshot")
     export_parser.add_argument("--db", required=True)
@@ -3918,6 +4074,7 @@ EXIT_CODES = {
     "ILLEGAL": 13,
     "ARCHIVE": 13,
     "HEALTH": 13,
+    "EFFICIENCY": 13,
     "ACTIVE": 13,
     "DEPENDENCIES": 13,
     "UNSENT": 13,
@@ -3952,6 +4109,7 @@ def exit_code_for(error_code: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

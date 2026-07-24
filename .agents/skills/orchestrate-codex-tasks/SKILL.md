@@ -37,7 +37,7 @@ description: Coordinate the current Codex task as a Controller with multiple ind
 2. 完整读取 [references/protocol.md](references/protocol.md)，使用其中的语言规则、消息格式和标题状态机。
 3. 完整读取 [references/ledger.md](references/ledger.md)，按其中顺序建立本地 SQLite 事实源、记录外部操作并恢复运行。
 4. 完整读取 [references/dispatch.md](references/dispatch.md)，使用规范化清单、DAG、写边界和渲染脚本。
-5. `runLanguage=en` 时完整读取 [references/worker-prompt.en.md](references/worker-prompt.en.md)；`runLanguage=zh-CN` 时完整读取 [references/worker-prompt.zh-CN.md](references/worker-prompt.zh-CN.md)。只加载并派发匹配语言的模板。
+5. 默认完整读取匹配 `runLanguage` 的 compact 模板（[references/worker-prompt.en.compact.md](references/worker-prompt.en.compact.md) 或 [references/worker-prompt.zh-CN.compact.md](references/worker-prompt.zh-CN.compact.md)）。只有 manifest 中存在显式 `coordinationProfile=strict` 时，再完整读取同语言的 strict 模板（[references/worker-prompt.en.md](references/worker-prompt.en.md) 或 [references/worker-prompt.zh-CN.md](references/worker-prompt.zh-CN.md)）。不得加载另一种语言。
 6. 如果当前运行时工具契约与 reference 不同，以当前可调用工具的 schema 为准，并用 `runLanguage` 向用户说明会影响行为的差异。
 
 ## 1. 执行授权门
@@ -72,14 +72,14 @@ description: Coordinate the current Codex task as a Controller with multiple ind
    - 默认 `maxActiveWorkers = 8`。
    - 接受用户明确给出的正整数覆盖值。
    - 并发值只是上限；不要为了填满槽位制造低价值 Worker。
-7. 把工作拆成轻量 DAG。每个 Worker 必须具备单一目标、明确输入、2–5 个可观察里程碑、独立验收条件、文件所有权和已知依赖。
+7. 把工作拆成轻量 DAG。每个 Worker 必须具备单一目标、明确输入、2–5 个可观察里程碑、独立验收条件、文件所有权和已知依赖。只读任务默认省略档位并推断为 `lean`，写入任务推断为 `standard`；只有高风险、强审计需求才显式使用 `strict`。
 8. 派发前进行任务重量审查。跨越多个顶层子系统、包含多个可独立验收目标、同时承担实现/规格/TDD/完整回归，或存在大量未知前置时，优先继续拆分；确实不可拆时，记录原因、首个健康检查点和预计最慢合法命令。
 9. 把高度耦合实现、共享接口定稿、用户偏好、风险接受和最终整合留给主控。
 10. 使用项目列表选择执行位置：
    - 用户明确指定的主机优先于默认策略；
    - 否则优先本地同项目；
    - 仅在本地缺少必要项目、依赖或能力时选择明确匹配的远程项目。
-11. 写 draft manifest，使用 dispatch script 校验并编译，再用 ledger script 原子激活。清单校验、持久化和 task 规划完成前不创建 Worker。
+11. 写 draft manifest，使用 dispatch script 校验并编译，再用 ledger script 原子激活。浏览器、模拟器、GPU 或限流服务确实稀缺时才声明 `resourceCapacities/resourceClaims`；不要为普通任务制造资源配置。清单校验、持久化和 task 规划完成前不创建 Worker。
 
 ## 3. 选择 Worker 环境
 
@@ -96,9 +96,9 @@ description: Coordinate the current Codex task as a Controller with multiple ind
 
 对依赖已满足的 Worker，最多派发到 `maxActiveWorkers`：
 
-1. 从 ledger `status` 和当前编译 manifest 运行 dispatch `ready`；只处理 `readyWorkers`，不得仅凭上下文估算槽位或依赖。
+1. 从 ledger `status` 和当前编译 manifest 运行 dispatch `ready`；只处理 `readyWorkers`，不得仅凭上下文估算槽位、依赖、写边界或资源容量。
 2. 为 Worker 使用清单中的稳定 `workerId`，例如 `W1`。
-3. 使用 dispatch `render-worker` 生成匹配语言的完整 Worker Prompt、`promptHash`、标题和 create request。Prompt 必须注入：
+3. 使用 dispatch `render-worker` 生成匹配语言和自适应档位的 Worker Prompt、`promptHash`、标题和 create request。`lean/standard` 使用 compact 模板，显式 `strict` 使用完整模板。Prompt 必须注入：
    - `runId`、`workerId`；
    - 主控 `threadId` 和需要时的 `hostId`；
    - 目标、范围、输入、禁止事项；
@@ -124,9 +124,10 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 
 - 默认最多 8 个活跃 Worker，放入一个最多 8 目标的等待集合。
 - 用户把并发调到 8 以上时，按稳定顺序分成每组最多 8 个目标；每轮先对所有组取即时增量快照，再对一个轮转组做不超过约 15 秒的等待。
-- 保证每个活跃 Worker 至少每 60 秒被主动观察一次。
+- `PROVISIONING/RUNNING` Worker 最迟每 60 秒主动观察一次；`REVIEW` 最迟每 2 分钟一次；`BLOCKED` 以事件驱动为主，最长每 5 分钟复核一次。内部观察不等于用户可见消息。
 - 派发、阻塞、验收完成、重试、范围变化和替换发生时立即向用户汇报。
-- 没有状态变化时，最长约每 60 秒发送一次有信息量的简短心跳。
+- 没有状态变化时，不为每轮观察发送消息；只有运行仍需要用户关注时，最长约每 10 分钟发送一次有信息量的摘要。
+- 同一任务服务连续 2 次 timeout 或无响应后，停止切换 `list/read/wait` 变体探测 2 分钟，保存当前 cursor 并使用账本与本地证据；冷却后只做一次探测。timeout 不是 Worker 消失的证据，不得据此重复创建或终结 Worker。
 - 不把 Worker 的自称完成直接视为验收通过。
 - 不把消息频繁等同于有效进展。每次 `PROGRESS` 更新当前里程碑、已经关闭和剩余的验收项、预计剩余时间，以及正在运行的已声明长命令。
 - 每条可接受的 Worker 消息先以 `WORKER_MESSAGE_APPLIED` 落账，再执行标题、回复、Handoff 或下一波派发。旧 `seq` 只确认忽略，不重复状态变化。
@@ -141,18 +142,18 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 出现以下任一软触发条件时立即进行效率审查：
 
 - 连续约 30 分钟没有关闭验收项，且不处于已声明的合法长命令窗口；长命令超过预期约 2 倍或已无可观察执行迹象时也触发。
-- 连续 3 条 `PROGRESS` 没有关闭里程碑，或出现 3 次可预见的“主控放行一步、Worker 执行一步”往返。
+- 连续 3 条 `PROGRESS` 没有关闭里程碑，或账本自动记录 3 次成功的“主控放行一步、Worker 执行一步”往返。
 - 新增原计划之外的验收族、顶层子系统、写入边界或未知架构工作。
 - 出现 timeout、重复诊断、上下文压缩、消息序号重复或同一失败路径反复尝试。
 - `activeCount=1` 且 `queuedCount=0` 持续约 15 分钟，而剩余工作仍包含可独立执行单元。
 
 审查流程：
 
-1. 用 `WORKER_HEALTH_CHANGED` 将 Worker 健康度记为 `AT_RISK`，再使用 dispatch script 渲染 `REPLANNING` 主控标题；Worker 继续执行时保留 `✍️` 并加“效率审查”后缀，暂停等待重规划时使用 `⌛️`。
+1. 三次微放行由成功的 `SEND_MESSAGE` outcome 自动把 Worker 标为 `AT_RISK`；其他触发条件用 `WORKER_HEALTH_CHANGED` 记录。再使用 dispatch script 渲染 `REPLANNING` 主控标题；Worker 继续执行时保留 `✍️` 并加“效率审查”后缀，暂停等待重规划时使用 `⌛️`。
 2. 发送 `CHECKPOINT`，要求 Worker 在安全边界暂停新阶段并回报：已完成/剩余验收项、当前里程碑、文件与未提交成果、重复或冗余工作、可拆分单元、预计剩余时间和下一条不可中断命令。
 3. 主控在原始授权内选择并记录一种处理；task 规格变化使用 `TASK_REPLANNED`，新 manifest 重新编译并激活：
    - 继续当前计划，但给出理由、下一个可验证里程碑和复查时间；
-   - 发送 `REPLAN`，一次性授权已经核对的有界 manifest，采用首个 nonzero/timeout 即停，避免逐步微授权；
+   - 发送带 `executionPlan` 的 `REPLAN`，一次性授权已经核对的有界步骤；必须声明 `maxWallTimeMinutes`，并令 `stopOnFirstNonzero=true`、`stopOnTimeout=true`，避免逐步微授权；
    - 删除被更强证据覆盖的重复执行，不能降低原验收标准；
    - 将独立剩余工作拆给新 Worker，并收窄原 Worker；新发现且不属于原范围的工作必须请求用户授权；
    - 一次有界重规划后仍无有效进展时，保护并回收成果，再按终止与取代流程替换 Worker。
@@ -242,7 +243,7 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 
 主控上下文丢失或任务恢复时：
 
-1. 从稳定运行目录找到 ledger；先执行 `verify`、`status` 和 `pending`，从账本恢复 `runId`、`runLanguage`、Controller、manifest、Worker、cursor、消息序号和 operation。
+1. 从稳定运行目录找到 ledger；先执行一次 `snapshot`，在同一只读事务中取得 verification、边界化 status 和详细 pending operations，并恢复 `runId`、`runLanguage`、Controller、manifest、Worker、cursor、消息序号和 operation。只有专项诊断才分别调用 `verify/status/pending`。
 2. 使用任务列表、即时等待快照和必要的紧凑读取收集外部观察事实，再用 ledger `audit` 比较；标题不能覆盖账本。
 3. 先核对所有 `INTENT/UNKNOWN` 外部操作，写入真实 outcome；没有证明失败前不重试创建、消息、改名或 Handoff。
 4. 需要时用 ledger `manifest` 导出当前编译清单，并用 dispatch `ready` 重新计算，不从压缩后的记忆重建队列。

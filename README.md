@@ -39,7 +39,10 @@ You can expect:
 - Idempotent operation tracking around task creation, cross-task messages, title changes, and Handoff, preventing an ambiguous timeout from silently creating or sending the same work twice.
 - A paused affected Worker plus facts, options, and a recommendation when user input is required.
 - Health checks that distinguish useful milestone closure from frequent messages, then request a safe checkpoint when a Worker becomes too broad, repetitive, or slow.
-- Adaptive replanning that can batch-authorize a reviewed test manifest, remove redundant execution, or split independent remaining work without weakening acceptance.
+- Automatic counting of successful micro-control round trips; after three, the Controller requires a wall-time-bounded, fail-fast batch `REPLAN` instead of approving predictable steps one at a time.
+- Compact `lean` Prompts for read-only Workers and `standard` Prompts for writers, with the full `strict` protocol available explicitly for high-risk work.
+- Adaptive replanning that can batch-authorize a reviewed execution plan, remove redundant execution, or split independent remaining work without weakening acceptance.
+- Optional resource capacities that prevent browsers, simulators, or other scarce services from being over-scheduled.
 - `🔍` after a Worker reports `DONE`; `✅` appears only after independent Controller acceptance and result recovery.
 - `🗑️` only after useful results are recovered or intentionally rejected and any replacement Worker is recorded.
 - Isolated worktrees for code-writing Workers by default, reducing concurrent-edit conflicts.
@@ -209,7 +212,7 @@ The core workflow is:
 3. **Durable planning:** A deterministic CLI validates and compiles the Worker DAG, worktree policy, milestones, acceptance criteria, and write boundaries; the Controller atomically activates it in the local SQLite ledger.
 4. **Idempotent dispatch:** Before creating a task, sending a message, changing a title, or starting Handoff, the Controller records an intent. It records the sanitized outcome only after calling the real Codex tool.
 5. **Two-way coordination:** Workers send `ACCEPTED`, `PROGRESS`, `BLOCKED`, and `DONE`; the Controller also observes tasks through wait and read capabilities and persists each accepted message and cursor.
-6. **Health and replanning:** The Controller tracks closed acceptance items, scope growth, serial decision round trips, timeouts, and one-to-one tail work. Soft thresholds cause `CHECKPOINT`, then a bounded `REPLAN` when useful.
+6. **Health and replanning:** The Controller tracks closed acceptance items, scope growth, serial decision round trips, timeouts, and one-to-one tail work. Successful `DECISION/REVISION` messages are counted automatically; after three, the Controller checkpoints and sends a bounded batch `REPLAN`.
 7. **Blocker decisions:** Workers pause instead of guessing about product, architecture, permission, or risk decisions and send options back to the Controller.
 8. **Acceptance and integration:** The Controller checks deliverables and validation evidence. Code results are handed back in dependency order and validated together.
 9. **Recovery:** After context compaction or restart, the Controller verifies the ledger, reconciles pending operations with visible task facts, restores the current manifest, and resumes without duplicating Workers.
@@ -225,12 +228,14 @@ The core workflow is:
 | Durable state | Private local SQLite ledger; Controller is the sole writer |
 | External side effects | Idempotent `intent → actual tool → sanitized outcome` |
 | Maximum active Workers | 8 by default; adjustable before or during a run |
+| Worker protocol profile | Read-only defaults to `lean`, writers to `standard`, and high-risk work opts into `strict` |
+| Scarce resources | Optional `resourceCapacities/resourceClaims`, reserved by each `ready` batch |
 | Code writes | Prefer isolated worktrees with explicit file boundaries |
 | Host selection | Prefer local execution; support an explicit remote `hostId` |
 | Commits and publishing | Do not commit, push, open PRs, or publish unless the original request authorizes it |
 | Permissions | Do not bypass approvals, sandboxes, credentials, or external-write restrictions |
 | Worker expansion | Workers may not create subagents, other tasks, or additional Workers |
-| Efficiency review | Soft thresholds request a safe checkpoint; they do not automatically stop a Worker or weaken validation |
+| Efficiency review | Three successful micro-control messages force a safe checkpoint/bounded batch; Workers are not automatically stopped and validation is not weakened |
 | Replanning | May batch safe steps or split independent work within the original authorization; a dirty worktree must be checkpointed before another writer takes over |
 | Completion | A Worker `DONE` message enters `🔍`; Controller acceptance and result recovery are required for `✅` |
 | Retirement | Cancelled or superseded work receives `🗑️` only after useful-result disposition and replacement tracking |
@@ -248,7 +253,7 @@ The initializer adds the runtime directory to the repository-local `.git/info/ex
 
 Only the Controller writes the database through the bundled `ledger.py`. Workers cannot access it and report through structured cross-task messages instead. The database stores normalized task specifications, lifecycle and health state, stable IDs, message sequences, wait cursors, decisions, integration status, and an append-only event trail. Operation requests and outcomes use closed, minimal field sets; verification checks SQLite integrity, foreign keys, revisions, hashes, addresses, sequences, and terminal-state invariants. It deliberately rejects secret-like keys and values, but that is a final safeguard—not permission to persist raw credentials or logs.
 
-On recovery, the Controller runs ledger integrity, status, pending-operation, and observed-task audits before doing more work. If the ledger cannot be safely initialized, it does not dispatch Workers. If a ledger write fails mid-run, it stops new external side effects, reports degraded state, and reconciles or restores a verified backup before resuming.
+On recovery, the Controller uses one read-only `snapshot` to obtain integrity, status, and pending operations, then audits observed task facts before doing more work. After two consecutive task-service timeouts it stops alternative probing for two minutes, preserving cursors and local evidence; this is not treated as proof that a Worker disappeared. If the ledger cannot be safely initialized, it does not dispatch Workers. If a ledger write fails mid-run, it stops new external side effects, reports degraded state, and reconciles or restores a verified backup before resuming.
 
 ## 7. Runtime Requirements and Compatibility
 
@@ -279,7 +284,9 @@ Runtime tool names and schemas may change between Codex versions. The Skill uses
         │   ├── ledger.md
         │   ├── protocol.md
         │   ├── tool-contracts.md
+        │   ├── worker-prompt.en.compact.md
         │   ├── worker-prompt.en.md
+        │   ├── worker-prompt.zh-CN.compact.md
         │   └── worker-prompt.zh-CN.md
         └── scripts/
             ├── dispatch.py

@@ -13,6 +13,8 @@ Coordination address
 - workerId: {{WORKER_ID}}
 - controllerThreadId: {{CONTROLLER_THREAD_ID}}
 - controllerHostId: {{CONTROLLER_HOST_ID_OR_REMOVE_LINE}}
+- coordinationProfile: {{COORDINATION_PROFILE}}
+- resourceClaims: {{RESOURCE_CLAIMS}}
 
 Language
 - Use English for every human-readable coordination message, task update, blocker, recommendation, and completion report.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,42 @@ class DispatchCliTest(unittest.TestCase):
             encoding="utf-8",
         )
         return path
+
+    def test_render_title_forces_utf8_output_when_host_stdio_is_gbk(self) -> None:
+        title_file = self.write_json(
+            "gbk-title.json",
+            {
+                "scope": "worker",
+                "runLanguage": "zh-CN",
+                "runId": "run-demo",
+                "workerId": "W1",
+                "action": "处理历史任务",
+                "state": "RUNNING",
+            },
+        )
+
+        process = subprocess.run(
+            [
+                sys.executable,
+                str(DISPATCH),
+                "render-title",
+                "--input-file",
+                str(title_file),
+            ],
+            cwd=REPOSITORY_ROOT,
+            env={**os.environ, "PYTHONIOENCODING": "gbk:strict"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(
+            process.returncode,
+            0,
+            msg=f"stderr: {process.stderr!r}\nstdout: {process.stdout!r}",
+        )
+        rendered = json.loads(process.stdout.decode("utf-8").splitlines()[-1])
+        self.assertTrue(str(rendered["title"]).startswith("✍️"))
 
     def manifest(
         self,
@@ -330,6 +367,133 @@ class DispatchCliTest(unittest.TestCase):
         self.assertIn('"hostId": "remote-host"', english["prompt"])
         self.assertEqual(english["promptHash"], english["ledgerIntentRequest"]["promptHash"])
 
+    def test_worker_profiles_are_adaptive_and_strict_is_opt_in(self) -> None:
+        default_file = self.write_json("profiles-default.json", self.manifest())
+        standard = self.invoke(
+            "render-worker",
+            "--manifest-file",
+            str(default_file),
+            "--worker-id",
+            "W1",
+        )
+        lean = self.invoke(
+            "render-worker",
+            "--manifest-file",
+            str(default_file),
+            "--worker-id",
+            "W2",
+        )
+        self.assertEqual(standard["coordinationProfile"], "standard")
+        self.assertEqual(lean["coordinationProfile"], "lean")
+        self.assertIn("只在独立 worktree", standard["prompt"])
+        self.assertIn("本任务只读", lean["prompt"])
+
+        strict_manifest = self.manifest()
+        strict_manifest["workers"][0]["coordinationProfile"] = "strict"
+        strict_file = self.write_json("profiles-strict.json", strict_manifest)
+        strict = self.invoke(
+            "render-worker",
+            "--manifest-file",
+            str(strict_file),
+            "--worker-id",
+            "W1",
+        )
+        self.assertEqual(strict["coordinationProfile"], "strict")
+        self.assertGreater(len(strict["prompt"]), len(standard["prompt"]))
+        self.assertNotIn("{{", strict["prompt"])
+
+        invalid_manifest = self.manifest()
+        invalid_manifest["workers"][0]["coordinationProfile"] = "lean"
+        invalid_file = self.write_json("profiles-invalid.json", invalid_manifest)
+        invalid = self.invoke(
+            "validate-manifest",
+            "--manifest-file",
+            str(invalid_file),
+            expected_returncode=10,
+        )
+        self.assertEqual(invalid["code"], "INVALID_FIELD")
+
+    def test_ready_respects_optional_resource_capacity_and_releases_blocked_claims(
+        self,
+    ) -> None:
+        manifest = self.manifest()
+        manifest["maxActiveWorkers"] = 3
+        manifest["resourceCapacities"] = {"browser": 1}
+        manifest["workers"][0]["resourceClaims"] = {"browser": 1}
+        manifest["workers"][1]["resourceClaims"] = {"browser": 1}
+        manifest_file = self.write_json("resource-manifest.json", manifest)
+        manifest_hash = self.invoke(
+            "validate-manifest",
+            "--manifest-file",
+            str(manifest_file),
+        )["manifestHash"]
+
+        def status(name: str, state: str | None) -> Path:
+            active = [] if state is None else [{"workerId": "W1", "state": state}]
+            return self.write_json(
+                name,
+                {
+                    "run": {
+                        "runId": "run-demo",
+                        "protocolVersion": 2,
+                        "runLanguage": "zh-CN",
+                        "currentManifestHash": manifest_hash,
+                        "status": "ACTIVE",
+                        "maxActiveWorkers": 3,
+                    },
+                    "activeWorkers": active,
+                    "recentTerminalWorkers": [],
+                    "pendingOperations": [],
+                    "taskStates": {
+                        "W1": "QUEUED" if state is None else "DISPATCHED",
+                        "W2": "QUEUED",
+                        "W3": "QUEUED",
+                    },
+                },
+            )
+
+        empty = self.invoke(
+            "ready",
+            "--manifest-file",
+            str(manifest_file),
+            "--status-file",
+            str(status("resource-empty.json", None)),
+        )
+        self.assertEqual(
+            [worker["workerId"] for worker in empty["readyWorkers"]],
+            ["W1"],
+        )
+        self.assertIn(
+            "RESOURCE_CAPACITY_EXCEEDED:browser",
+            {
+                item["workerId"]: item["reasons"]
+                for item in empty["notReady"]
+            }["W2"],
+        )
+
+        running = self.invoke(
+            "ready",
+            "--manifest-file",
+            str(manifest_file),
+            "--status-file",
+            str(status("resource-running.json", "RUNNING")),
+        )
+        self.assertEqual(running["resourceUsage"]["browser"]["holders"], ["W1"])
+        self.assertEqual(running["readyWorkers"], [])
+
+        blocked = self.invoke(
+            "ready",
+            "--manifest-file",
+            str(manifest_file),
+            "--status-file",
+            str(status("resource-blocked.json", "BLOCKED")),
+        )
+        self.assertEqual(
+            [worker["workerId"] for worker in blocked["readyWorkers"]],
+            ["W2"],
+        )
+        self.assertEqual(blocked["resourceUsage"]["browser"]["holders"], ["W2"])
+
     def test_concurrent_boundary_conflict_and_local_write_are_rejected(self) -> None:
         conflict = self.manifest()
         conflict["workers"][2]["dependencies"] = []
@@ -432,6 +596,32 @@ class DispatchCliTest(unittest.TestCase):
         )
         self.assertIn("controllerSeq=004 command=CHECKPOINT", command["prompt"])
         self.assertNotIn("hostId", command["sendMessage"])
+        replan_file = self.write_json(
+            "bounded-replan-command.json",
+            {
+                "protocolVersion": 2,
+                "runId": "run-demo",
+                "runLanguage": "zh-CN",
+                "workerId": "W1",
+                "threadId": "thread-W1",
+                "controllerSeq": 5,
+                "command": "REPLAN",
+                "instructions": ["按有界批次执行"],
+                "executionPlan": {
+                    "steps": ["运行测试", "根据结果修复", "复测"],
+                    "stopOnFirstNonzero": True,
+                    "stopOnTimeout": True,
+                    "maxWallTimeMinutes": 20,
+                },
+            },
+        )
+        replan = self.invoke(
+            "render-command",
+            "--input-file",
+            str(replan_file),
+        )
+        self.assertIn("executionPlan:", replan["prompt"])
+        self.assertIn("maxWallTimeMinutes=20", replan["prompt"])
 
         controller_title_file = self.write_json(
             "controller-title.json",

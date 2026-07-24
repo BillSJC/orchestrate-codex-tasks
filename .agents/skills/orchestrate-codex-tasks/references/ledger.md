@@ -248,7 +248,7 @@ outcome 同样使用封闭字段集合；不要直接保存原始工具返回。
 
 `DONE` 只把 Worker 置为 `REVIEW`。`ACCEPTED` 和 `RETIRED` 必须通过 `WORKER_STATE_CHANGED` 写入 `archiveReady=true` 和非空 `terminalReason`；账本不会归档任务。
 
-每条 Worker event 还把当前 `details/next/needs/evidence` 的有界列表投影到 Worker 行；上下文恢复后不会只剩一个标题或一句 summary。健康事件保存有效进展、决策往返、范围变化、timeout 和下次复查时间。`STALLED` 必须与 `BLOCKED` 生命周期一致。
+每条 Worker event 还把当前 `details/next/needs/evidence` 的有界列表投影到 Worker 行；上下文恢复后不会只剩一个标题或一句 summary。健康事件保存有效进展、范围变化、timeout 和下次复查时间。成功发送 `DECISION/REVISION` 时账本自动增加决策往返，失败、未知或重复 outcome 不增加；累计 3 次自动进入 `AT_RISK` 并拒绝更多微放行，成功发送带安全 `executionPlan` 的 `REPLAN` 后清零。`STALLED` 必须与 `BLOCKED` 生命周期一致。
 
 读取紧凑快照：
 
@@ -262,13 +262,15 @@ cycle 只能按 `currentCycle + 1` 顺序启动。只有所有 Worker/task 已�
 
 ## 8. 恢复、核对与接管
 
-任何上下文恢复或主控重新进入运行时，先执行：
+任何上下文恢复或主控重新进入运行时，优先在一个只读事务中执行：
 
 ```text
-python3 <SKILL_DIR>/scripts/ledger.py verify --db <DB>
-python3 <SKILL_DIR>/scripts/ledger.py status --db <DB>
-python3 <SKILL_DIR>/scripts/ledger.py pending --db <DB>
+python3 <SKILL_DIR>/scripts/ledger.py snapshot \
+  --db <DB> \
+  --terminal-limit 20
 ```
+
+`snapshot` 同时返回 `verification`、边界化 `status` 和包含规范化 request 的详细 `pendingOperations`，避免三次读取跨越不同 revision。`verify/status/pending` 仍保留用于专项诊断。
 
 需要重新生成当前清单文件时：
 
@@ -396,6 +398,6 @@ schema 文件位于 [../scripts/sql/001_initial.sql](../scripts/sql/001_initial.
 2. 不重复已有工具调用；
 3. 保留当前安全边界和本轮观察事实；
 4. 用 `runLanguage` 立即向用户报告 `DEGRADED`、受影响 operation 和恢复选项；
-5. 修复或从已验证备份恢复并完成 `verify + status + pending + audit` 后再继续。
+5. 修复或从已验证备份恢复并完成 `snapshot + audit` 后再继续。
 
 不得把内存记忆冒充持久账本，也不得因账本故障自动归档、删除或重建 Worker。

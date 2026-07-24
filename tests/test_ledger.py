@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -256,6 +257,32 @@ class LedgerCliTest(unittest.TestCase):
         self.assertEqual(status["run"]["queuedCount"], 0)
         self.assertEqual(status["run"]["persistenceMode"], "LOCAL")
 
+    def test_status_forces_utf8_output_when_host_stdio_is_gbk(self) -> None:
+        self.initialize()
+        expected_title = "👑 [run-test] 跟进｜历史 Worker"
+        self.record(
+            "controller-title-with-emoji",
+            "RUN_UPDATED",
+            {"controllerTitle": expected_title},
+        )
+
+        process = subprocess.run(
+            [sys.executable, str(LEDGER), "status", "--db", str(self.database)],
+            cwd=REPOSITORY_ROOT,
+            env={**os.environ, "PYTHONIOENCODING": "gbk:strict"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(
+            process.returncode,
+            0,
+            msg=f"stderr: {process.stderr!r}\nstdout: {process.stdout!r}",
+        )
+        status = json.loads(process.stdout.decode("utf-8").splitlines()[-1])
+        self.assertEqual(status["run"]["controllerTitle"], expected_title)
+
     def test_missing_database_is_never_created_by_runtime_commands(self) -> None:
         missing = self.root / "missing" / "ledger.sqlite3"
         event = self.write_json(
@@ -394,6 +421,191 @@ class LedgerCliTest(unittest.TestCase):
             ["none"],
         )
         self.assertEqual(status["pendingOperations"], [])
+
+    def test_micro_control_round_trips_require_bounded_replan(self) -> None:
+        self.initialize()
+        self.plan_worker()
+        create = self.record_intent(
+            "CREATE_THREAD",
+            "create-W1-for-efficiency",
+            {"promptHash": "e" * 64},
+            worker_id="W1",
+        )
+        self.record_outcome(
+            str(create["operationId"]),
+            "SUCCEEDED",
+            {"threadId": "thread-W1"},
+        )
+
+        failed = self.record_intent(
+            "SEND_MESSAGE",
+            "decision-W1-failed",
+            {"command": "DECISION", "decision": "尝试一次"},
+            worker_id="W1",
+        )
+        self.record_outcome(
+            str(failed["operationId"]),
+            "FAILED",
+            {"summary": "消息未发送"},
+        )
+        self.assertEqual(
+            self.invoke("status", "--db", str(self.database))["activeWorkers"][0][
+                "decisionRoundTrips"
+            ],
+            0,
+        )
+
+        for index, command in enumerate(("DECISION", "REVISION", "DECISION"), start=1):
+            sent = self.record_intent(
+                "SEND_MESSAGE",
+                f"micro-W1-{index}",
+                {"command": command, "instructions": [f"微调 {index}"]},
+                worker_id="W1",
+            )
+            outcome = self.record_outcome(
+                str(sent["operationId"]),
+                "SUCCEEDED",
+                {"summary": "消息已发送"},
+            )
+            if index == 3:
+                duplicate = self.record_outcome(
+                    str(sent["operationId"]),
+                    "SUCCEEDED",
+                    {"summary": "消息已发送"},
+                )
+                self.assertTrue(duplicate["duplicate"])
+                self.assertFalse(outcome["duplicate"])
+
+        status = self.invoke("status", "--db", str(self.database))
+        worker = status["activeWorkers"][0]
+        self.assertEqual(worker["decisionRoundTrips"], 3)
+        self.assertEqual(worker["health"], "AT_RISK")
+        self.assertIn(
+            {"workerId": "W1", "reasons": ["DECISION_ROUND_TRIPS"]},
+            status["healthReviewCandidates"],
+        )
+
+        fourth_file = self.write_json(
+            "micro-W1-fourth.json",
+            {"command": "REVISION", "instructions": ["继续微调"]},
+        )
+        fourth = self.invoke(
+            "intent",
+            "--db",
+            str(self.database),
+            "--controller-thread-id",
+            self.controller,
+            "--request-id",
+            "micro-W1-fourth",
+            "--kind",
+            "SEND_MESSAGE",
+            "--worker-id",
+            "W1",
+            "--request-file",
+            str(fourth_file),
+            expected_returncode=13,
+        )
+        self.assertEqual(fourth["code"], "EFFICIENCY_REVIEW_REQUIRED")
+
+        checkpoint = self.record_intent(
+            "SEND_MESSAGE",
+            "checkpoint-W1-efficiency",
+            {"command": "CHECKPOINT", "reason": "读取安全边界"},
+            worker_id="W1",
+        )
+        self.record_outcome(
+            str(checkpoint["operationId"]),
+            "SUCCEEDED",
+            {"summary": "检查点已发送"},
+        )
+        unbounded_file = self.write_json(
+            "replan-W1-unbounded.json",
+            {"command": "REPLAN", "instructions": ["继续完成"]},
+        )
+        unbounded = self.invoke(
+            "intent",
+            "--db",
+            str(self.database),
+            "--controller-thread-id",
+            self.controller,
+            "--request-id",
+            "replan-W1-unbounded",
+            "--kind",
+            "SEND_MESSAGE",
+            "--worker-id",
+            "W1",
+            "--request-file",
+            str(unbounded_file),
+            expected_returncode=13,
+        )
+        self.assertEqual(unbounded["code"], "EFFICIENCY_REVIEW_REQUIRED")
+
+        bounded = self.record_intent(
+            "SEND_MESSAGE",
+            "replan-W1-bounded",
+            {
+                "command": "REPLAN",
+                "instructions": ["执行完整批次"],
+                "executionPlan": {
+                    "steps": ["测试", "修复", "复测"],
+                    "stopOnFirstNonzero": True,
+                    "stopOnTimeout": True,
+                    "maxWallTimeMinutes": 30,
+                },
+            },
+            worker_id="W1",
+        )
+        self.record_outcome(
+            str(bounded["operationId"]),
+            "SUCCEEDED",
+            {"summary": "批量重规划已发送"},
+        )
+        reset_worker = self.invoke(
+            "status",
+            "--db",
+            str(self.database),
+        )["activeWorkers"][0]
+        self.assertEqual(reset_worker["decisionRoundTrips"], 0)
+        self.assertEqual(reset_worker["health"], "HEALTHY")
+
+        allowed_again = self.record_intent(
+            "SEND_MESSAGE",
+            "decision-W1-after-replan",
+            {"command": "DECISION", "decision": "采用批次结果"},
+            worker_id="W1",
+        )
+        self.assertEqual(allowed_again["controllerSeq"], 7)
+
+    def test_recovery_snapshot_combines_consistent_status_and_pending_details(
+        self,
+    ) -> None:
+        self.initialize()
+        pending = self.record_intent(
+            "SET_TITLE",
+            "snapshot-pending-title",
+            {
+                "target": "controller",
+                "title": "👑 [run-test] 跟进｜轻量恢复",
+            },
+        )
+        snapshot = self.invoke(
+            "snapshot",
+            "--db",
+            str(self.database),
+            "--terminal-limit",
+            "5",
+        )
+        self.assertEqual(snapshot["code"], "RECOVERY_SNAPSHOT")
+        self.assertTrue(snapshot["verification"]["valid"])
+        self.assertEqual(snapshot["status"]["run"]["revision"], snapshot["verification"]["revision"])
+        self.assertEqual(
+            snapshot["pendingOperations"][0]["operation_id"],
+            pending["operationId"],
+        )
+        self.assertEqual(
+            snapshot["pendingOperations"][0]["request"]["target"],
+            "controller",
+        )
 
     def test_owner_idempotency_and_terminal_guards(self) -> None:
         self.initialize()

@@ -13,6 +13,8 @@
 - workerId: {{WORKER_ID}}
 - controllerThreadId: {{CONTROLLER_THREAD_ID}}
 - controllerHostId: {{CONTROLLER_HOST_ID_OR_REMOVE_LINE}}
+- coordinationProfile: {{COORDINATION_PROFILE}}
+- resourceClaims: {{RESOURCE_CLAIMS}}
 
 语言
 - 所有人类可读的协调消息、任务进度、阻塞、建议和完成报告都使用中文。

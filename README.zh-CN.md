@@ -39,7 +39,10 @@
 - 任务创建、跨任务消息、改名和 Handoff 都记录幂等 operation；工具调用结果含糊时先核对事实，不会静默重复创建或发送。
 - 需要用户决定时，受影响的 Worker 暂停，主控给出事实、选项和建议。
 - 主控区分“消息频繁”和“有效里程碑关闭”；Worker 过重、重复或过慢时，先请求安全 checkpoint。
-- 主控可以在不降低验收标准的前提下批量授权已核对的测试 manifest、删除冗余执行，或拆分独立剩余工作。
+- 主控自动统计成功的微放行往返；连续 3 次后要求有墙钟上限且遇错即停的批量 `REPLAN`，不再逐步批准可预见动作。
+- 只读 Worker 默认使用轻量 `lean` Prompt，写入 Worker 使用 `standard`；高风险任务可显式选择完整 `strict` 协议。
+- 主控可以在不降低验收标准的前提下批量授权已核对的执行计划、删除冗余执行，或拆分独立剩余工作。
+- 可选资源容量会阻止浏览器、模拟器或其他稀缺服务被过量并发占用。
 - Worker 发送 `DONE` 后先显示 `🔍`；只有主控独立验收并完成成果回收后才标记为 `✅`。
 - 只有在有价值成果已经回收或明确不再采用、替代 Worker 已记录后，才标记为 `🗑️`。
 - 写代码的 Worker 默认在相互隔离的 worktree 中工作，减少并发修改冲突。
@@ -208,7 +211,7 @@ flowchart TD
 3. **持久化规划**：确定性 CLI 校验并编译 Worker DAG、worktree 策略、里程碑、验收和写边界，主控再把清单原子激活到本地 SQLite 账本。
 4. **幂等派发**：创建任务、发消息、改标题或启动 Handoff 前先记录 intent；实际 Codex 工具调用后，只保存清理过的 outcome。
 5. **双向协调**：Worker 使用 `ACCEPTED`、`PROGRESS`、`BLOCKED` 和 `DONE` 主动回报；主控也主动等待和读取，并持久化每条有效消息与 cursor。
-6. **健康与重规划**：主控跟踪已关闭验收项、范围增长、逐步放行往返、timeout 和一对一长尾。触发软阈值时先 `CHECKPOINT`，必要时执行有界 `REPLAN`。
+6. **健康与重规划**：主控跟踪已关闭验收项、范围增长、逐步放行往返、timeout 和一对一长尾。成功的 `DECISION/REVISION` 自动计数，连续 3 次后先 `CHECKPOINT`，再执行有界批量 `REPLAN`。
 7. **阻塞决策**：Worker 不自行猜测产品、架构、权限或风险决策，而是暂停受影响工作并把选项发回主控。
 8. **验收与回收**：主控核对交付物和测试证据。代码成果按依赖顺序回收到本地，并完成组合验证。
 9. **恢复**：上下文压缩或重启后，主控先验证账本、核对 pending operation 与可见任务事实、恢复当前 manifest，再继续调度，不重复创建 Worker。
@@ -224,12 +227,14 @@ flowchart TD
 | 持久状态 | 私有本地 SQLite 账本，只有主控写入 |
 | 外部副作用 | 幂等 `intent → 实际工具 → 清理后的 outcome` |
 | 最大活跃 Worker | 默认 8，用户可以在运行前或运行中调整 |
+| Worker 协议档位 | 只读默认 `lean`，写入默认 `standard`，高风险任务显式 `strict` |
+| 稀缺资源 | 可选 `resourceCapacities/resourceClaims`，`ready` 同批预留 |
 | 代码写入 | 优先使用独立 worktree，并声明文件边界 |
 | 主机选择 | 本地主机优先，也支持明确的远程 `hostId` |
 | 提交与发布 | 不自动 commit、push、开 PR 或发布，除非原请求明确授权 |
 | 权限 | 不绕过审批、沙箱、凭据或外部写入限制 |
 | Worker 扩散 | Worker 不得创建子 Agent、其他任务或新的 Worker |
-| 效率审查 | 软阈值只请求安全 checkpoint，不自动停止 Worker，也不降低验证标准 |
+| 效率审查 | 连续 3 次成功微放行强制切换到安全 checkpoint/有界批次，不自动停止 Worker，也不降低验证标准 |
 | 重规划 | 可在原授权内批量放行安全步骤或拆分独立工作；另一个写入者接管前必须先保护脏 worktree 成果 |
 | 完成标准 | Worker 的 `DONE` 先进入 `🔍`；通过主控验收和成果回收后才能标记 `✅` |
 | 废弃标准 | 取消或被取代的任务只有在成果处置和替代关系记录后才能标记 `🗑️` |
@@ -247,7 +252,7 @@ flowchart TD
 
 只有主控通过内置 `ledger.py` 写数据库。Worker 不访问账本，只通过结构化跨任务消息报告。账本保存规范化 task、生命周期与健康度、稳定 ID、消息序号、等待 cursor、决定、整合状态和 append-only 事件轨迹。operation request/outcome 使用封闭且最小化的字段集合；校验会检查 SQLite integrity、foreign key、revision、内容哈希、地址、序号和终态不变量。脚本会拒绝明显的密钥字段和值，但这只是最后防线，不代表可以保存原始凭据或日志。
 
-恢复时，主控先执行完整性、状态、pending operation 和观察事实核对，再继续运行。账本无法安全初始化时不会派发 Worker；运行中账本写入失败时会停止新的外部副作用、报告降级状态，并在核对或恢复已验证备份后继续。
+恢复时，主控用一次只读 `snapshot` 取得完整性、状态和 pending operation，再核对观察事实后继续运行。任务服务连续两次 timeout 时暂停替代式探测 2 分钟，保留 cursor 和本地证据；这不会被解释为 Worker 消失。账本无法安全初始化时不会派发 Worker；运行中账本写入失败时会停止新的外部副作用、报告降级状态，并在核对或恢复已验证备份后继续。
 
 ## 7. 运行要求与兼容性
 
@@ -278,7 +283,9 @@ flowchart TD
         │   ├── ledger.md
         │   ├── protocol.md
         │   ├── tool-contracts.md
+        │   ├── worker-prompt.en.compact.md
         │   ├── worker-prompt.en.md
+        │   ├── worker-prompt.zh-CN.compact.md
         │   └── worker-prompt.zh-CN.md
         └── scripts/
             ├── dispatch.py

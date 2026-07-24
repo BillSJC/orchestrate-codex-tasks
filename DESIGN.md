@@ -572,7 +572,7 @@ W3: 设计测试场景 ─┘
 2. 再对下一轮轮转组执行一次最长约 15 秒的阻塞等待。
 3. 每轮更新各 Worker 的 cursor；组的顺序不因单个 Worker 完成而任意重排。
 4. 任一 Worker 的 `BLOCKED` 或完成状态一旦被发现，立即处理，不等整轮结束。
-5. 保证所有活跃 Worker 至少每 60 秒被主动观察一次。
+5. `PROVISIONING/RUNNING` 最迟每 60 秒观察一次，`REVIEW` 最迟每 2 分钟一次，`BLOCKED` 事件驱动且最长每 5 分钟复核一次。
 
 这个分组只解决工具单次 8 目标的限制，不表示主控应该为了填满并发值而制造低价值子任务。
 
@@ -801,7 +801,7 @@ acceptanceDelta:
 对每个 Worker：
 
 1. 生成唯一 `workerId`。
-2. 填充完整 Worker Prompt，直接注入主控 `threadId` 和 `hostId`。
+2. 填充自适应 Worker Prompt，直接注入主控 `threadId` 和 `hostId`：只读默认 compact `lean`，写入默认 compact `standard`，高风险任务才显式使用完整 `strict`。
 3. 根据读写属性选择环境：写项目文件默认 `worktree`，只读任务可用 `local`，非项目任务用 `projectless`。
 4. 调用 `create_thread`。
 5. 记录返回的：
@@ -837,7 +837,7 @@ acceptanceDelta:
 
 1. **推送通道**：接收 Worker 的跨任务 `ACCEPTED`、`PROGRESS`、`BLOCKED`、`DONE`。
 2. **拉取通道**：
-   - 活跃 Worker 不超过 8 时，每轮用一个 `wait_threads` 集合等待至多约 30 秒。
+   - 活跃 Worker 不超过 8 时，每轮用一个 `wait_threads` 集合等待至多约 15 秒。
    - 活跃 Worker 超过 8 时，按 7.5 节的监控分组执行轮转快照。
    - 使用返回的 cursor 增量观察。
    - 状态不清楚时调用 `read_thread`。
@@ -850,9 +850,9 @@ acceptanceDelta:
 - Worker 阻塞：立即汇报。
 - Worker 完成并通过验收：立即汇报。
 - 发生重试、范围变化或任务替换：立即汇报。
-- 运行中没有状态变化：约每 60 秒给出一次简短进度心跳。
+- 运行中没有状态变化：不逐轮发心跳；仍需用户关注的长运行约每 10 分钟给出一次有信息量摘要。
 
-不要把每次 30 秒轮询都变成无信息量消息；只有达到用户侧心跳时间或发生状态变化时才汇报。
+内部观察不等于用户消息。同一任务服务连续 2 次 timeout 或无响应时，熔断 2 分钟，不切换 `list/read/wait` 变体轮询；保存 cursor 和本地证据，冷却后只探测一次。timeout 不能证明 Worker 消失。
 
 ### 阶段 C.1：效率审查与重规划
 
@@ -862,14 +862,14 @@ acceptanceDelta:
 
 1. 约 30 分钟没有关闭验收项，且不在已声明长命令窗口；长命令超过预计约 2 倍或无执行迹象也触发。
 2. 连续 3 条 `PROGRESS` 没有关闭里程碑。
-3. 发生 3 次可预见的逐步放行往返。
+3. 账本自动记录 3 次成功的可预见逐步放行往返。
 4. 新增原计划之外的验收族、顶层子系统或写入边界。
 5. 出现 timeout、重复诊断、上下文压缩、序号重复或同一失败路径反复尝试。
 6. `activeCount=1`、`queuedCount=0` 持续约 15 分钟，且剩余工作可拆分。
 
 触发后：
 
-1. 健康度改为 `AT_RISK`，主控标题改为 `👑 [runId] 重规划｜总体目标`。
+1. 三次微放行由成功的消息 outcome 自动把健康度改为 `AT_RISK`；其他触发由主控记录。主控标题改为 `👑 [runId] 重规划｜总体目标`。
 2. 向 Worker 发送 `CHECKPOINT`，要求在安全边界暂停新阶段并返回已完成/剩余验收、文件与未提交成果、冗余执行、可拆分工作和 ETA。
 3. 主控在原始授权内选择：
    - 继续并设置下一个可验证里程碑和复查时间；
@@ -1084,8 +1084,8 @@ Handoff 初次返回 `operationId` 只代表启动；仍需 `get_handoff_status`
 
 主控恢复时固定执行：
 
-1. 从稳定目录打开账本并执行 `verify`。
-2. 读取 `status` 和 `pending`。
+1. 从稳定目录打开账本并执行一次只读事务 `snapshot`，同时读取 verification、边界化 status 和详细 pending operations。
+2. 只有专项诊断才分别执行 `verify/status/pending`。
 3. 用 `list_threads`、`wait_threads timeoutMs:0` 和必要的紧凑 `read_thread` 收集 observed facts。
 4. 使用只读 `audit` 比较账本和外部事实。
 5. 先核对 pending operation，未证明失败前不重试。
@@ -1181,7 +1181,7 @@ Handoff 初次返回 `operationId` 只代表启动；仍需 `get_handoff_status`
 - 运行中 ledger 写失败时停止新的 create/message/title/Handoff，不重复已经发出的工具调用。
 - 把运行报告为 `DEGRADED`，说明受影响 operation、最后成功 revision 和恢复选项。
 - 优先修复原账本；必要时把已验证 backup 恢复到新文件，`restore` 不自动覆盖或 promote。
-- 运行 `verify + status + pending + audit` 通过后才恢复派发。
+- 运行 `snapshot + audit` 通过后才恢复派发。
 - ledger 丢失而任务仍存在时，用新文件保守重建并标记 `reconstructed`；不能唯一匹配时保持阻塞。
 - 不把内存表格或标题当作等价替代，也不因账本故障自动归档或重建 Worker。
 
@@ -1450,7 +1450,7 @@ https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/or
 
 ### 场景 7：主控恢复
 
-- 从稳定目录打开 SQLite，执行 `verify + status + pending`。
+- 从稳定目录打开 SQLite，执行一次 `snapshot`。
 - 通过 `runId` 搜索 Worker，用即时 wait/read 形成 observed facts 并执行 `audit`。
 - 先核对含糊 operation，再导出 manifest 并重算 ready。
 - 重复消息不导致状态倒退，未证明失败的 create 不会重复执行。
@@ -1487,7 +1487,7 @@ https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/or
 
 - 主控接受明确正整数 12，不静默压回 8。
 - 活跃 Worker 分为最多 8 个目标的稳定监控组。
-- 所有组至少每 60 秒获得一次主动观察。
+- 所有 `PROVISIONING/RUNNING` 组最迟每 60 秒获得一次主动观察。
 - 主控向用户报告新上限、活跃数和排队数。
 
 ### 场景 13：运行中把并发度从 8 降到 3
@@ -1599,7 +1599,7 @@ https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/or
 - cycle 完成或重大重规划前使用 SQLite backup API 创建一致副本。
 - backup 和 restore 后都执行 integrity 与不变量校验。
 - restore 只写到不存在的新文件并返回 `promoted=false`，不覆盖当前账本。
-- 用户决定切换前，Controller 完成 `verify + status + pending + audit`。
+- 用户决定切换前，Controller 完成 `snapshot + audit`。
 
 ### 场景 30：敏感数据拒绝
 
@@ -1637,11 +1637,12 @@ Skill 实现完成后，应满足：
 - create/message/title/Handoff 全部使用封闭字段、幂等 intent/outcome；恢复时 pending operation 不被盲目重试。
 - event append-only，task/Worker/run 终态、消息序号和主控序号不能通过通用状态更新或 SQL trigger 回退。
 - cycle 只能顺序推进，存在非终态 work 或 pending/unknown operation 时不能提前完成。
-- context 压缩后可以从 `verify/status/pending/audit + current manifest` 恢复，不依赖内存表格。
+- context 压缩后可以从 `snapshot/audit + current manifest` 恢复，不依赖内存表格。
 - backup/restore 非破坏且经过校验，restore 不自动替换当前账本。
 - 敏感字段和密钥形态被拒绝，运行数据库及导出不进入 Git。
 - 每个 Worker Prompt 都包含主控 `threadId`。
-- 每个 Worker Prompt 都包含正确的 `runLanguage`，并使用对应的完整语言模板。
+- 每个 Worker Prompt 都包含正确的 `runLanguage`，并使用对应语言和 `lean/standard/strict` 档位模板。
+- 旧 manifest 省略新档位和资源字段时保持原规范化哈希；显式资源声明由 `ready` 同批预留。
 - 跨主机 Worker 同时获得主控 `hostId`。
 - 英文请求的主控回复、标题、Worker 消息和汇总使用英文；中文请求对应使用中文。
 - 交付物语言不反向改变协调语言；显式语言切换能够传播到所有活跃 Worker。
@@ -1662,7 +1663,7 @@ Skill 实现完成后，应满足：
 - 默认 `maxActiveWorkers` 为 8，用户可以在运行前或运行中调整。
 - 超过 8 个活跃 Worker 时，监控分组仍覆盖全部 Worker。
 - 远程 Worker 正确记录和传递 `hostId`，且本地主机保持默认优先级。
-- 主控在运行期间不让用户超过约 60 秒看不到任何有意义的进度信息。
+- 状态变化立即汇报；无变化的长运行至多约每 10 分钟提供一次有意义摘要。
 - 最终结果由主控整合并独立验证。
 - 全部完成后任务仍保留；自动编排不调用归档工具，`✅/🗑️` 表示用户可以人工归档。
 
@@ -1688,13 +1689,16 @@ Skill 实现完成后，应满足：
 | 只读 Worker 环境 | 本地项目优先，也可使用 `projectless` |
 | 主机选择 | 支持远程 `hostId`，本地主机优先 |
 | 成果回收 | 验收后串行 Handoff，随后运行 Local 组合验证 |
-| `wait_threads` 等待窗口 | 约 30 秒 |
-| 用户进度心跳 | 最长约 60 秒 |
+| `wait_threads` 等待窗口 | 约 15 秒 |
+| 用户进度摘要 | 状态变化立即；无变化且仍需关注时最长约 10 分钟 |
+| 任务服务熔断 | 连续 2 次 timeout/无响应后冷却 2 分钟 |
+| Worker 协调档位 | 只读默认 `lean`，写入默认 `standard`，高风险显式 `strict` |
+| 稀缺资源 | 可选 `resourceCapacities/resourceClaims` |
 | Worker 可观察里程碑 | 2–5 个 |
 | 无验收关闭效率审查 | 约 30 分钟；合法长命令窗口除外 |
 | 一对一长尾效率审查 | `activeCount=1`、`queuedCount=0` 且仍可拆分时约 15 分钟 |
 | 无里程碑关闭 PROGRESS | 连续 3 条触发审查 |
-| 可预见逐步放行往返 | 3 次触发审查 |
+| 可预见逐步放行往返 | 3 次成功发送后自动触发，并要求有界 `REPLAN` |
 | 长命令偏离 | 超过已声明预计墙钟约 2 倍触发审查，不自动停止 |
 | 调度健康度 | `HEALTHY/AT_RISK/STALLED`，与生命周期正交 |
 | Worker 自动重建 | 同一失败最多 1 次 |
@@ -1743,7 +1747,7 @@ Skill 实现完成后，应满足：
 5. 将 SQLite 路径、schema、单写者、intent/outcome、备份、恢复和隐私规则放入 `references/ledger.md`。
 6. 将 manifest、DAG、ready、写边界和 renderer 契约放入 `references/dispatch.md`。
 7. 实现 `scripts/orchestration_common.py`、`scripts/dispatch.py`、`scripts/ledger.py` 和 `scripts/sql/001_initial.sql`。
-8. 将完整 Worker Prompt 分别放入 `references/worker-prompt.en.md` 和 `references/worker-prompt.zh-CN.md`，运行时只读取匹配 `runLanguage` 的一份，并禁止 Worker 访问主控账本。
+8. 将 compact Worker Prompt 放入 `worker-prompt.*.compact.md`，完整 strict Prompt 保留在 `worker-prompt.*.md`；运行时只读取匹配 `runLanguage` 与档位的一份，并禁止 Worker 访问主控账本。
 9. 依据最终 Skill 内容生成 `agents/openai.yaml`，启用严格描述驱动的隐式选择。
 10. 运行官方 `quick_validate.py` 和 Python 3.9/当前 Python 单元测试。
 11. 执行静态审计：

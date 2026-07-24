@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -44,6 +45,17 @@ class OrchestrationError(Exception):
         self.code = code
         self.message = message
         self.details = details
+
+
+def configure_utf8_stdio() -> None:
+    """Keep CLI output independent of the host's legacy default code page."""
+    for stream, errors in (
+        (sys.stdout, "strict"),
+        (sys.stderr, "backslashreplace"),
+    ):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors=errors)
 
 
 def utc_now() -> str:
@@ -157,6 +169,57 @@ def require_string_list(
             f"{field} must contain between {minimum} and {maximum} items",
         )
     return [item.strip() for item in value]
+
+
+def normalize_execution_plan(value: Any, field: str = "executionPlan") -> dict[str, Any]:
+    """Validate a bounded batch of Worker actions used to replace micro-management."""
+    if not isinstance(value, dict):
+        raise OrchestrationError("INVALID_FIELD", f"{field} must be an object")
+    allowed = {
+        "steps",
+        "stopOnFirstNonzero",
+        "stopOnTimeout",
+        "maxWallTimeMinutes",
+    }
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise OrchestrationError(
+            "INVALID_FIELD",
+            f"{field} contains unsupported fields",
+            {"fields": unknown},
+        )
+    steps = require_string_list(
+        value.get("steps"),
+        f"{field}.steps",
+        minimum=1,
+        maximum=32,
+    )
+    stop_on_first_nonzero = value.get("stopOnFirstNonzero")
+    stop_on_timeout = value.get("stopOnTimeout")
+    if stop_on_first_nonzero is not True or stop_on_timeout is not True:
+        raise OrchestrationError(
+            "INVALID_FIELD",
+            (
+                f"{field}.stopOnFirstNonzero and {field}.stopOnTimeout "
+                "must both be true"
+            ),
+        )
+    max_wall_time = value.get("maxWallTimeMinutes")
+    if (
+        not isinstance(max_wall_time, int)
+        or isinstance(max_wall_time, bool)
+        or not 1 <= max_wall_time <= 1440
+    ):
+        raise OrchestrationError(
+            "INVALID_FIELD",
+            f"{field}.maxWallTimeMinutes must be an integer between 1 and 1440",
+        )
+    return {
+        "steps": steps,
+        "stopOnFirstNonzero": True,
+        "stopOnTimeout": True,
+        "maxWallTimeMinutes": max_wall_time,
+    }
 
 
 def normalize_boundary(boundary: str) -> str:

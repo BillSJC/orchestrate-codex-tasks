@@ -20,8 +20,10 @@ from orchestration_common import (  # noqa: E402
     OrchestrationError,
     boundaries_overlap,
     canonical_json,
+    configure_utf8_stdio,
     load_json_file,
     normalize_boundary,
+    normalize_execution_plan,
     print_result,
     require_string_list,
     require_text,
@@ -58,6 +60,8 @@ COMMANDS = {
     "LANGUAGE_UPDATE",
     "STOP",
 }
+COORDINATION_PROFILES = {"lean", "standard", "strict"}
+RESOURCE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,31}$")
 MANIFEST_FIELDS = {
     "protocolVersion",
     "runId",
@@ -66,6 +70,7 @@ MANIFEST_FIELDS = {
     "controllerHostId",
     "projectId",
     "maxActiveWorkers",
+    "resourceCapacities",
     "workers",
     "boundaryOverlapAllowances",
     "topologicalOrder",
@@ -93,6 +98,8 @@ WORKER_FIELDS = {
     "acceptance",
     "milestones",
     "healthCheckpoint",
+    "coordinationProfile",
+    "resourceClaims",
 }
 
 
@@ -121,6 +128,39 @@ def require_bool(value: Any, field: str) -> bool:
     if not isinstance(value, bool):
         raise OrchestrationError("INVALID_FIELD", f"{field} must be a boolean")
     return value
+
+
+def normalize_resource_map(value: Any, field: str) -> dict[str, int]:
+    if not isinstance(value, dict) or not 1 <= len(value) <= 32:
+        raise OrchestrationError(
+            "INVALID_FIELD",
+            f"{field} must be an object with between 1 and 32 resources",
+        )
+    normalized: dict[str, int] = {}
+    for name, quantity in sorted(value.items()):
+        if not isinstance(name, str) or RESOURCE_NAME_RE.fullmatch(name) is None:
+            raise OrchestrationError(
+                "INVALID_FIELD",
+                f"{field} has an invalid resource name: {name!r}",
+            )
+        if (
+            not isinstance(quantity, int)
+            or isinstance(quantity, bool)
+            or quantity <= 0
+        ):
+            raise OrchestrationError(
+                "INVALID_FIELD",
+                f"{field}.{name} must be a positive integer",
+            )
+        normalized[name] = quantity
+    return normalized
+
+
+def effective_coordination_profile(worker: dict[str, Any]) -> str:
+    explicit = worker.get("coordinationProfile")
+    if explicit is not None:
+        return explicit
+    return "standard" if worker["writesFiles"] else "lean"
 
 
 def check_protocol(value: Any) -> None:
@@ -240,6 +280,7 @@ def normalize_worker(
     *,
     index: int,
     project_id: str | None,
+    resource_capacities: dict[str, int] | None,
 ) -> dict[str, Any]:
     if not isinstance(worker, dict):
         raise OrchestrationError("INVALID_FIELD", f"workers[{index}] must be an object")
@@ -302,6 +343,52 @@ def normalize_worker(
             "INVALID_FIELD",
             "sharedLocalWriteAuthorized applies only to local environments",
         )
+    coordination_profile = worker.get("coordinationProfile")
+    if (
+        coordination_profile is not None
+        and coordination_profile not in COORDINATION_PROFILES
+    ):
+        raise OrchestrationError(
+            "INVALID_FIELD",
+            f"{prefix}.coordinationProfile must be lean, standard, or strict",
+        )
+    if coordination_profile == "lean" and writes_files:
+        raise OrchestrationError(
+            "INVALID_FIELD",
+            f"{worker_id} cannot use the lean profile while writesFiles is true",
+        )
+    resource_claims = None
+    if "resourceClaims" in worker:
+        resource_claims = normalize_resource_map(
+            worker["resourceClaims"],
+            f"{prefix}.resourceClaims",
+        )
+        if resource_capacities is None:
+            raise OrchestrationError(
+                "RESOURCE_CAPACITY_REQUIRED",
+                f"{worker_id} resourceClaims require manifest.resourceCapacities",
+            )
+        unknown_resources = sorted(set(resource_claims) - set(resource_capacities))
+        if unknown_resources:
+            raise OrchestrationError(
+                "RESOURCE_CAPACITY_REQUIRED",
+                f"{worker_id} claims undeclared resources",
+                {"resources": unknown_resources},
+            )
+        oversized = {
+            name: {
+                "claim": quantity,
+                "capacity": resource_capacities[name],
+            }
+            for name, quantity in resource_claims.items()
+            if quantity > resource_capacities[name]
+        }
+        if oversized:
+            raise OrchestrationError(
+                "RESOURCE_CAPACITY_EXCEEDED",
+                f"{worker_id} resource claim exceeds declared capacity",
+                {"resources": oversized},
+            )
 
     dependencies = require_string_list(
         worker.get("dependencies", []),
@@ -373,6 +460,10 @@ def normalize_worker(
             f"{prefix}.healthCheckpoint",
         ),
     }
+    if coordination_profile is not None:
+        normalized["coordinationProfile"] = coordination_profile
+    if resource_claims is not None:
+        normalized["resourceClaims"] = resource_claims
     return normalized
 
 
@@ -557,6 +648,12 @@ def normalize_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         maximum=256,
     )
     project_id = optional_text(manifest.get("projectId"), "projectId", maximum=256)
+    resource_capacities = None
+    if "resourceCapacities" in manifest:
+        resource_capacities = normalize_resource_map(
+            manifest["resourceCapacities"],
+            "resourceCapacities",
+        )
     worker_values = manifest.get("workers")
     if not isinstance(worker_values, list) or not 1 <= len(worker_values) <= 256:
         raise OrchestrationError(
@@ -564,7 +661,12 @@ def normalize_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             "workers must contain between 1 and 256 Worker specifications",
         )
     workers = [
-        normalize_worker(worker, index=index, project_id=project_id)
+        normalize_worker(
+            worker,
+            index=index,
+            project_id=project_id,
+            resource_capacities=resource_capacities,
+        )
         for index, worker in enumerate(worker_values)
     ]
     worker_ids = [worker["workerId"] for worker in workers]
@@ -603,6 +705,8 @@ def normalize_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         "boundaryOverlapAllowances": authorizations,
         "sequentialBoundaryOverlaps": sequential_overlaps,
     }
+    if resource_capacities is not None:
+        normalized["resourceCapacities"] = resource_capacities
     normalized["manifestHash"] = stable_hash(normalized)
     return normalized
 
@@ -730,7 +834,13 @@ def render_worker_prompt(
     template_root: Path,
 ) -> dict[str, Any]:
     language = manifest["runLanguage"]
-    template_name = "worker-prompt.en.md" if language == "en" else "worker-prompt.zh-CN.md"
+    coordination_profile = effective_coordination_profile(worker)
+    suffix = "" if coordination_profile == "strict" else ".compact"
+    template_name = (
+        f"worker-prompt.en{suffix}.md"
+        if language == "en"
+        else f"worker-prompt.zh-CN{suffix}.md"
+    )
     prompt = extract_text_template(template_root / template_name)
     controller_host_id = manifest["controllerHostId"]
     if controller_host_id is None:
@@ -746,6 +856,26 @@ def render_worker_prompt(
         )
     starting_state = worker["environment"].get("startingState")
     not_applicable = "not applicable" if language == "en" else "不适用"
+    profile_rules = {
+        ("en", "lean"): (
+            "- This is read-only: do not modify files or external state.\n"
+            "- If completion requires a write, report BLOCKED and wait."
+        ),
+        ("en", "standard"): (
+            "- Modify only the declared write boundary in the independent worktree.\n"
+            "- Do not hand off, commit, push, open a PR, or publish unless explicitly authorized.\n"
+            "- DONE includes git status, changed files, and validation evidence."
+        ),
+        ("zh-CN", "lean"): (
+            "- 本任务只读：不得修改文件或外部状态。\n"
+            "- 若完成目标必须写入，发送 BLOCKED 并等待主控。"
+        ),
+        ("zh-CN", "standard"): (
+            "- 只在独立 worktree 的声明写入边界内修改。\n"
+            "- 未明确授权时，不得 Handoff、commit、push、开 PR 或发布。\n"
+            "- DONE 附 git status、变更文件与验证证据。"
+        ),
+    }.get((language, coordination_profile), "")
     values = {
         "PROTOCOL_VERSION": str(PROTOCOL_VERSION),
         "RUN_ID": manifest["runId"],
@@ -773,6 +903,11 @@ def render_worker_prompt(
         "ACCEPTANCE": list_text(worker["acceptance"], language),
         "MILESTONES": list_text(worker["milestones"], language),
         "HEALTH_CHECKPOINT": worker["healthCheckpoint"],
+        "COORDINATION_PROFILE": coordination_profile,
+        "PROFILE_RULES": profile_rules,
+        "RESOURCE_CLAIMS": canonical_json(worker.get("resourceClaims", {}))
+        if worker.get("resourceClaims")
+        else not_applicable,
         "SEQ": "<SEQ>",
         "TYPE": "<TYPE>",
     }
@@ -809,6 +944,8 @@ def render_worker_prompt(
     return {
         "workerId": worker["workerId"],
         "taskId": worker["taskId"],
+        "coordinationProfile": coordination_profile,
+        "resourceClaims": worker.get("resourceClaims", {}),
         "title": title,
         "prompt": prompt,
         "promptHash": prompt_hash,
@@ -848,6 +985,9 @@ def planned_event(manifest: dict[str, Any], worker: dict[str, Any]) -> dict[str,
             "healthCheckpoint",
         )
     }
+    for optional_key in ("coordinationProfile", "resourceClaims"):
+        if optional_key in worker:
+            task[optional_key] = worker[optional_key]
     return {
         "idempotencyKey": (
             f"{manifest['runId']}:task:{worker['taskId']}:planned:v{PROTOCOL_VERSION}"
@@ -990,6 +1130,22 @@ def ready_workers(manifest: dict[str, Any], status: dict[str, Any]) -> dict[str,
         min(runtime_limit, manifest["maxActiveWorkers"]) - len(active_ids),
     )
     by_worker = {worker["workerId"]: worker for worker in manifest["workers"]}
+    resource_capacities = manifest.get("resourceCapacities", {})
+    resource_usage = {name: 0 for name in resource_capacities}
+    resource_holders: dict[str, list[str]] = {
+        name: [] for name in resource_capacities
+    }
+    for active_worker_id in sorted(active_ids):
+        active_state = states[active_worker_id].get("state")
+        active_worker = by_worker.get(active_worker_id)
+        if (
+            active_state not in {"PROVISIONING", "RUNNING"}
+            or active_worker is None
+        ):
+            continue
+        for resource, quantity in active_worker.get("resourceClaims", {}).items():
+            resource_usage[resource] += quantity
+            resource_holders[resource].append(active_worker_id)
     unknown_active_ids = sorted(active_ids - set(by_worker))
     unknown_pending_create = sorted(
         worker_id
@@ -1055,6 +1211,9 @@ def ready_workers(manifest: dict[str, Any], status: dict[str, Any]) -> dict[str,
                 for right in other["writeBoundary"]
             ):
                 reasons.append(f"ACTIVE_WRITE_BOUNDARY_CONFLICT:{other_id}")
+        for resource, quantity in worker.get("resourceClaims", {}).items():
+            if resource_usage[resource] + quantity > resource_capacities[resource]:
+                reasons.append(f"RESOURCE_CAPACITY_EXCEEDED:{resource}")
         if reasons:
             blocked.append({"workerId": worker_id, "reasons": sorted(set(reasons))})
             continue
@@ -1069,15 +1228,28 @@ def ready_workers(manifest: dict[str, Any], status: dict[str, Any]) -> dict[str,
                 "dependencies": worker["dependencies"],
                 "environment": worker["environment"]["type"],
                 "writeBoundary": worker["writeBoundary"],
+                "coordinationProfile": effective_coordination_profile(worker),
+                "resourceClaims": worker.get("resourceClaims", {}),
             }
         )
         selected_ids.add(worker_id)
+        for resource, quantity in worker.get("resourceClaims", {}).items():
+            resource_usage[resource] += quantity
+            resource_holders[resource].append(worker_id)
     return {
         "slotsAvailable": slots,
         "readyWorkers": ready,
         "notReady": blocked,
         "activeWorkerIds": sorted(active_ids),
         "acceptedWorkerIds": sorted(accepted_ids),
+        "resourceUsage": {
+            resource: {
+                "used": resource_usage[resource],
+                "capacity": capacity,
+                "holders": resource_holders[resource],
+            }
+            for resource, capacity in resource_capacities.items()
+        },
     }
 
 
@@ -1137,6 +1309,24 @@ def command_render_worker(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_render_command(args: argparse.Namespace) -> dict[str, Any]:
     value = load_json_file(args.input_file)
+    reject_unknown_fields(
+        value,
+        allowed={
+            "protocolVersion",
+            "runId",
+            "runLanguage",
+            "workerId",
+            "threadId",
+            "hostId",
+            "controllerSeq",
+            "command",
+            "decision",
+            "instructions",
+            "acceptanceDelta",
+            "executionPlan",
+        },
+        field="Controller command",
+    )
     check_protocol(value.get("protocolVersion"))
     run_id = validate_identifier(value.get("runId"), "runId")
     worker_id = validate_identifier(value.get("workerId"), "workerId")
@@ -1166,6 +1356,14 @@ def command_render_command(args: argparse.Namespace) -> dict[str, Any]:
         "acceptanceDelta",
         minimum=1,
     )
+    execution_plan = None
+    if value.get("executionPlan") is not None:
+        if command != "REPLAN":
+            raise OrchestrationError(
+                "INVALID_FIELD",
+                "executionPlan is allowed only for REPLAN",
+            )
+        execution_plan = normalize_execution_plan(value["executionPlan"])
     prompt_lines = [
         (
             f"[ORCH run={run_id} worker={worker_id} "
@@ -1178,6 +1376,18 @@ def command_render_command(args: argparse.Namespace) -> dict[str, Any]:
         "acceptanceDelta:",
         *[f"- {item}" for item in acceptance_delta],
     ]
+    if execution_plan is not None:
+        prompt_lines.extend(
+            [
+                "executionPlan:",
+                *[f"- {step}" for step in execution_plan["steps"]],
+                (
+                    "executionLimits: "
+                    f"maxWallTimeMinutes={execution_plan['maxWallTimeMinutes']}; "
+                    "stopOnFirstNonzero=true; stopOnTimeout=true"
+                ),
+            ]
+        )
     prompt = "\n".join(prompt_lines)
     validate_safe_data(prompt)
     send_message: dict[str, Any] = {"threadId": thread_id, "prompt": prompt}
@@ -1314,6 +1524,7 @@ EXIT_CODES = {
     "UNKNOWN_DEPENDENCY": 12,
     "WRITE_BOUNDARY": 13,
     "WORKTREE": 13,
+    "RESOURCE": 13,
     "ARCHIVE": 13,
     "PROJECT_ID": 14,
     "TEMPLATE": 15,
@@ -1329,6 +1540,7 @@ def exit_code_for(error_code: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

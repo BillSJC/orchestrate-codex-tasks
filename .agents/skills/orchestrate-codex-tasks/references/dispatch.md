@@ -19,8 +19,8 @@
 - 校验 Worker DAG、2–5 个里程碑和必需验收字段；
 - 强制写入型 Worker 默认使用独立 worktree；
 - 检测可能同时运行的 Worker 写边界冲突；
-- 根据账本快照选择依赖满足、槽位可用的 Worker；
-- 渲染匹配 `runLanguage` 的完整 Worker Prompt、标题和结构化消息；
+- 根据账本快照选择依赖满足、槽位和可选资源容量可用的 Worker；
+- 渲染匹配 `runLanguage` 与协调档位的 Worker Prompt、标题和结构化消息；
 - 输出可传给高层 Codex 工具的参数对象。
 
 它不负责：
@@ -46,6 +46,9 @@
   "controllerHostId": "<OMIT_WHEN_NOT_NEEDED>",
   "projectId": "<REAL_ID_FROM_LIST_PROJECTS>",
   "maxActiveWorkers": 8,
+  "resourceCapacities": {
+    "simulator": 1
+  },
   "workers": [
     {
       "taskId": "core-api",
@@ -68,6 +71,10 @@
         "type": "worktree"
       },
       "writesFiles": true,
+      "coordinationProfile": "standard",
+      "resourceClaims": {
+        "simulator": 1
+      },
       "sharedLocalWriteAuthorized": false,
       "writeBoundary": [
         "src/api/**",
@@ -106,6 +113,9 @@
 | `writesFiles` | 写任何项目文件时为 `true` |
 | `writeBoundary` | 相对路径，不允许绝对路径或 `..` |
 | `sharedLocalWriteAuthorized` | 仅用户明确接受共享 Local 写入风险时为 `true` |
+| `coordinationProfile` | 可选 `lean/standard/strict`；省略时只读推断 `lean`，写入推断 `standard` |
+| `resourceCapacities` | 可选运行级正整数容量表；仅在确有稀缺资源时声明 |
+| `resourceClaims` | 可选 Worker 正整数需求表，名称必须已在运行级容量中声明 |
 | `milestones` | 2–5 个可观察里程碑 |
 | `healthCheckpoint` | 首个复查点和已知长命令墙钟时间 |
 
@@ -129,6 +139,8 @@ worktree 起始状态只有两种：
 ```
 
 默认省略 `startingState`。
+
+`lean` 只能用于 `writesFiles=false`。推断出的默认档位不会写回规范化 manifest，因此旧 manifest 的内容与 `manifestHash` 保持兼容；显式字段才进入编译结果。
 
 ## 3. 校验和编译
 
@@ -182,9 +194,10 @@ python3 <SKILL_DIR>/scripts/dispatch.py ready \
 - 所有依赖已经 `ACCEPTED`；
 - 没有 pending `CREATE_THREAD` intent；
 - 当前活跃数未超过 manifest 和账本两者较小的上限；
+- 可选 `resourceClaims` 不超过本批原子预留后的 `resourceCapacities`；
 - 写边界不与活跃或本批已选 Worker 冲突。
 
-`notReady` 给出机器可读原因。存在 manifest 之外的活跃 Worker 或 pending create 时，脚本保守阻止新派发，等待 Controller 先执行 audit/recovery。主控不得因为槽位空闲绕过这些原因，也不得为了凑满并发制造 Worker。
+`notReady` 给出机器可读原因，资源不足使用 `RESOURCE_CAPACITY_EXCEEDED:<name>`。`PROVISIONING/RUNNING` 占用资源，`BLOCKED/REVIEW` 释放计算资源但仍计入活跃槽位并保留写边界。存在 manifest 之外的活跃 Worker 或 pending create 时，脚本保守阻止新派发，等待 Controller 先执行 audit/recovery。主控不得因为槽位空闲绕过这些原因，也不得为了凑满并发制造 Worker。
 
 每次创建成功、Worker 终态、依赖变化、用户调整并发或 manifest 重规划后重新计算。脚本只选择候选；Controller 仍逐个执行 intent、create、outcome 和改名。
 
@@ -202,7 +215,9 @@ python3 <SKILL_DIR>/scripts/dispatch.py render-worker \
 
 | 字段 | 用途 |
 |---|---|
-| `prompt` | 完整本地化 Worker Prompt |
+| `prompt` | 按语言与协调档位渲染的 Worker Prompt |
+| `coordinationProfile` | 实际采用的 `lean/standard/strict` 档位 |
+| `resourceClaims` | 本 Worker 的可选资源需求 |
 | `promptHash` | 账本核对 |
 | `title` | Worker 获得真实 `threadId` 后设置的 `✍️` 标题 |
 | `createThread` | 实际 `create_thread` 参数候选 |
@@ -219,6 +234,7 @@ python3 <SKILL_DIR>/scripts/dispatch.py render-worker \
 渲染器会：
 
 - 只选择匹配 `runLanguage` 的模板；
+- 默认让只读 Worker 使用 compact `lean`、写入 Worker 使用 compact `standard`；只有显式 `strict` 使用原完整模板；
 - 填入 `protocolVersion=2`、Controller 地址、范围、边界和验收；
 - 同主机不需要 `hostId` 时删除整个字段；
 - 把 Worker 消息示例的动态 `seq/type` 写为 `<SEQ>/<TYPE>`；
@@ -266,6 +282,25 @@ python3 <SKILL_DIR>/scripts/dispatch.py render-command \
 ```
 
 使用输出的 `sendMessage` 调用实际消息工具，再写对应 outcome。序号来自账本，不从聊天上下文推断。
+
+`DECISION/REVISION` 只有在 outcome 为 `SUCCEEDED` 时才自动增加 `decisionRoundTrips`；失败、未知和重复 outcome 不增加。累计 3 次后，新的微放行会被拒绝，`CHECKPOINT` 仍可使用；后续 `REPLAN` 必须同时在 intent 和渲染输入中携带：
+
+```json
+{
+  "executionPlan": {
+    "steps": [
+      "运行目标测试",
+      "根据首个失败修复",
+      "复测并整理证据"
+    ],
+    "stopOnFirstNonzero": true,
+    "stopOnTimeout": true,
+    "maxWallTimeMinutes": 30
+  }
+}
+```
+
+有界 `REPLAN` 成功后自动清零往返计数。未达到阈值时不强制新字段，以兼容已有运行。
 
 ## 7. 生命周期标题
 

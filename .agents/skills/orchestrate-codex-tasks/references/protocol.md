@@ -58,18 +58,20 @@
 
 ## 3. Worker Prompt 模板
 
-按 `runLanguage` 只读取并使用一份模板：
+按 `runLanguage` 和 `coordinationProfile` 选择模板：
 
-- `en`：[worker-prompt.en.md](worker-prompt.en.md)
-- `zh-CN`：[worker-prompt.zh-CN.md](worker-prompt.zh-CN.md)
+- `en` compact：[worker-prompt.en.compact.md](worker-prompt.en.compact.md)
+- `zh-CN` compact：[worker-prompt.zh-CN.compact.md](worker-prompt.zh-CN.compact.md)
+- 显式 `strict`：使用同语言的 [worker-prompt.en.md](worker-prompt.en.md) 或 [worker-prompt.zh-CN.md](worker-prompt.zh-CN.md)
 
 派发规则：
 
-1. 完整读取匹配语言的模板。
-2. 填充所有占位符，并让任务目标、范围、边界和验收说明使用 `runLanguage`；路径、命令、代码和交付物要求保持原样。
-3. 不临时翻译另一份模板，也不把两种模板混合进同一个 Worker Prompt。
-4. 优先使用 [dispatch.md](dispatch.md) 中的 renderer 填充模板，并将完成后的模板正文作为 `create_thread` 初始 `prompt`。
-5. 同一主机且 `hostId` 可省略时，删除整个 `controllerHostId` 行和消息调用中的整个 `hostId` 字段，不传空字符串。
+1. 未显式指定档位时，只读任务推断为 `lean`，写入任务推断为 `standard`；两者使用 compact 模板。只有高风险或强审计任务显式使用 `strict` 完整模板。
+2. `lean` 禁止写文件；`standard` 保留 worktree、写边界与 Git 证据规则；三档都保留地址、消息序号、阻塞、完成和账本单写者规则。
+3. 完整读取实际选中的模板，填充所有占位符，并让任务目标、范围、边界和验收说明使用 `runLanguage`；路径、命令、代码和交付物要求保持原样。
+4. 不临时翻译另一份模板，也不把两种语言或两种档位混合进同一个 Worker Prompt。
+5. 优先使用 [dispatch.md](dispatch.md) 中的 renderer 填充模板，并将完成后的模板正文作为 `create_thread` 初始 `prompt`。
+6. 同一主机且 `hostId` 可省略时，删除整个 `controllerHostId` 行和消息调用中的整个 `hostId` 字段，不传空字符串。
 
 ## 4. Worker 到主控的消息
 
@@ -157,6 +159,13 @@ evidence:
 - git-status: <git status --short or not-applicable>
 ```
 
+### 4.4 低噪声观察
+
+- `PROVISIONING/RUNNING` 最迟每 60 秒观察一次，`REVIEW` 最迟每 2 分钟一次，`BLOCKED` 事件驱动且最长每 5 分钟复核一次。
+- 内部观察不产生逐轮用户心跳；状态未变化时，只有仍值得用户关注的长运行才约每 10 分钟汇报一次有信息量摘要。
+- 同一任务服务连续 2 次 timeout/无响应后熔断 2 分钟，不切换 `list/read/wait` 变体轮询；保留 cursor 与本地证据，冷却后只探测一次。
+- timeout 不能证明 Worker 消失，不得据此重复创建、发送或进入终态。
+
 ## 5. 主控到 Worker 的消息
 
 ```text
@@ -180,6 +189,8 @@ acceptanceDelta:
 - `STOP`：用户明确停止，或原任务已失去价值；主控完成成果处置审计后进入 `RETIRED`。
 
 `controllerSeq` 从 `001` 开始严格单调增加。Worker 保存 `lastControllerSeq`，只执行更大的序号；重复或更旧的命令不得重复执行，只用 `PROGRESS` 确认已忽略并给出已应用的最新序号。
+
+成功发送 `DECISION/REVISION` 会由账本自动累计微放行往返。达到 3 次后拒绝更多微放行，主控先用 `CHECKPOINT` 获取安全边界，再发送带 `executionPlan.steps`、`maxWallTimeMinutes`、`stopOnFirstNonzero=true` 和 `stopOnTimeout=true` 的 `REPLAN`。该有界消息成功后清零计数；失败、未知和重复 outcome 不计数。
 
 主控不能用 `REPLAN` 或 `SCOPE_UPDATE` 自行扩大用户授权，也不能把交付物语言变化误写成 `LANGUAGE_UPDATE`。
 
@@ -317,7 +328,7 @@ Worker 自称 `DONE` 只触发 `REVIEW` 和 `🔍`。只有主控验收并通过
 - 编译 manifest、任务规范、地址、生命周期、健康、序号、cursor、决定、整合、cycle 和外部 operation 都必须持久化。
 - `create_thread`、跨任务消息、标题和 Handoff 使用 `intent -> tool call -> outcome`，恢复时先核对 pending operation，不能盲目重试。
 - 所有事件使用稳定 idempotency key，事件表 append-only。
-- 每次上下文恢复先执行 `verify + status + pending + audit`，再继续观察、发消息或创建任务。
+- 每次上下文恢复先执行一次原子 `snapshot`，再用观察事实执行 `audit`；只有专项诊断才拆成 `verify/status/pending`。
 - `✅/🗑️` 仍只代表 `archiveReady=true`；账本和脚本都不自动归档。
 
 每个 Worker 保存：
@@ -382,20 +393,20 @@ Worker 自称 `DONE` 只触发 `REVIEW` 和 `🔍`。只有主控验收并通过
 
 1. 约 30 分钟没有关闭验收项，且不在已声明长命令窗口；长命令超过预期约 2 倍或已无执行迹象也触发。
 2. 连续 3 条 `PROGRESS` 没有关闭里程碑。
-3. 出现 3 次可预见的逐步放行往返。
+3. 账本自动记录 3 次成功的可预见逐步放行往返。
 4. 新增原计划之外的验收族、顶层子系统或写入边界。
 5. 出现 timeout、重复诊断、上下文压缩、序号重复或同一失败路径反复尝试。
 6. `activeCount=1`、`queuedCount=0` 持续约 15 分钟，且剩余工作可独立拆分。
 
 主控执行：
 
-1. 使用 `REPLANNING` 标题，向 Worker 发送 `CHECKPOINT`。
+1. 三次微放行自动进入 `AT_RISK`；其他触发由主控记录。使用 `REPLANNING` 标题，向 Worker 发送 `CHECKPOINT`。
 2. 核对已完成/剩余验收、文件与未提交成果、ETA、冗余执行、可拆分单元和下一条不可中断命令。
 3. 在原始授权内选择：继续并设下一检查点；发送 `REPLAN` 批量授权有界 manifest；删除被更强证据覆盖的重复执行；拆分独立剩余工作；或在成果保护后替换 Worker。
 4. 有未提交唯一成果的写入型 Worker 必须先完成授权内的 checkpoint、Handoff 或其他持久化，不能直接创建第二个写入者接管同一边界。
 5. 向用户报告触发原因、决定、并发变化、下一检查点和风险。
 
-批量授权应使用“首个 nonzero/timeout 即停”，避免每个可预见步骤都等待主控批准。`REPLAN` 不得降低验收、扩大范围、自动提交或制造低价值并发。只有一次有界重规划后仍无有效进展，才进入 `STALLED/BLOCKED`。
+批量授权必须在 `executionPlan` 中设置墙钟上限和“首个 nonzero/timeout 即停”，避免每个可预见步骤都等待主控批准。`REPLAN` 不得降低验收、扩大范围、自动提交或制造低价值并发。只有一次有界重规划后仍无有效进展，才进入 `STALLED/BLOCKED`。
 
 ## 9. 并发调整
 
@@ -425,13 +436,13 @@ effective = min(requested, 值得独立派发且已就绪的任务数, 当前环
 3. 立即用新语言回复用户，并更新主控标题。
 4. 向所有活跃 Worker 发送 `LANGUAGE_UPDATE`，其中 `language` 为新值。
 5. Worker 从下一条消息开始使用新语言，不重写历史消息。
-6. 新创建的 Worker 使用新语言对应的完整 Worker Prompt。
+6. 新创建的 Worker 使用新语言与既定协调档位对应的 Worker Prompt。
 
 ## 11. 恢复与去重
 
-1. 从稳定运行目录打开账本，执行 `verify`、`status` 和 `pending`。
+1. 从稳定运行目录打开账本，执行一次只读事务 `snapshot`，同时取得 verification、边界化 status 和详细 pending operations。
 2. 从账本恢复 `runId`、`runLanguage`、Controller、当前 manifest、Worker 地址、cursor 和序号。
-3. 列出任务并匹配 `runId-workerId`，用即时等待快照和必要的紧凑读取形成 observed facts，再执行只读 `audit`。
+3. 列出任务并匹配 `runId-workerId`，用即时等待快照和必要的紧凑读取形成 observed facts，再执行只读 `audit`；任务服务 timeout 时遵循 4.4 的熔断规则。
 4. 先核对 pending `INTENT/UNKNOWN`；没有外部证据前不重试创建、消息、标题或 Handoff。
 5. 只接受比 `lastSeq` 更新的 Worker 消息。
 6. 新命令只使用 ledger 分配的更大 `controllerSeq`，绝不复用旧序号。
