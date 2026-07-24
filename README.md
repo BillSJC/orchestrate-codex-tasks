@@ -46,7 +46,61 @@ $HOME/.agents/skills/orchestrate-codex-tasks/
 
 For private GitHub repositories, use credentials already configured on the machine. Do not paste access tokens or private keys into a normal Codex Prompt.
 
-## 2. When and How to Use It
+### Update an existing installation
+
+For a repository-scoped copy, update the repository checkout that contains `.agents/skills/orchestrate-codex-tasks`. Codex detects Skill file changes automatically; restart Codex if the updated instructions do not appear.
+
+For a user-level copy installed through `$skill-installer`, do not install over the existing directory: the installer stops when the destination already exists. Move the old copy to a backup location outside every Skill scan root, then install the GitHub URL again. The built-in installer uses `$CODEX_HOME/skills` (typically `$HOME/.codex/skills`); a manually authored user copy may instead be under `$HOME/.agents/skills`.
+
+You can ask Codex to perform the safe replacement:
+
+```text
+Safely update the user-level $orchestrate-codex-tasks installation.
+Move the existing copy to a backup directory outside all Skill scan roots; do not delete it.
+Then use $skill-installer to reinstall from:
+https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/orchestrate-codex-tasks
+Confirm that no stale duplicate user-level copy remains discoverable.
+Do not create any Workers.
+```
+
+Do not leave a backup containing the same `SKILL.md` inside `.agents/skills`, `$HOME/.agents/skills`, or `$CODEX_HOME/skills`. Codex does not merge Skills with the same `name`; duplicate copies can expose different versions. After validating the update in a new task, remove the external backup only when you no longer need rollback.
+
+## 2. What You Will See
+
+After dispatch, the Codex task list forms a visible Controller and Worker group:
+
+```text
+👑 [R7K2] Tracking 5 Workers | Prepare the release
+├── ✍️ [R7K2-W1] Implement the release script
+├── 🔍 [R7K2-W2] Verify update instructions | Awaiting Controller acceptance
+├── ⌛️ [R7K2-W3] Test deployment | Waiting for a target environment
+├── ✅ [R7K2-W4] Review safety boundaries | Accepted, no integration artifact
+└── 🗑️ [R7K2-W5] Review the old candidate | Superseded by W6
+```
+
+| Marker | Meaning |
+|---|---|
+| `👑` | The current task is the single Controller responsible for decisions, monitoring, acceptance, and synthesis |
+| `✍️` | The Worker is running or revising |
+| `🔍` | The Worker reported `DONE`; the Controller is validating or integrating the result |
+| `⌛️` | The Worker is blocked by a decision, clarification, permission, dependency, or failure |
+| `✅` | The Worker completed its Prompt scope, passed the archive-readiness gate, and is safe to archive manually |
+| `🗑️` | The Worker was cancelled, retired, invalidated, or superseded, passed the archive-readiness gate, and is safe to archive manually |
+
+Markers describe lifecycle, not deliverable type. A validated report, audit, design, DAG, or candidate package can receive `✅` even when it has no code or merge artifact. The Skill does not use `📋` as a state.
+
+You can expect:
+
+- An immediate dispatch report with Worker names, objectives, active and queued counts, concurrency limit, and execution location.
+- Worker messages when a task is accepted, reaches a substantive milestone, becomes blocked, or finishes.
+- Active monitoring by the Controller and timely reports of meaningful changes.
+- A paused affected Worker plus facts, options, and a recommendation when user input is required.
+- `🔍` after a Worker reports `DONE`; `✅` appears only after independent Controller acceptance and result recovery.
+- `🗑️` only after useful results are recovered or intentionally rejected and any replacement Worker is recorded.
+- Isolated worktrees for code-writing Workers by default, reducing concurrent-edit conflicts.
+- `✅` and `🗑️` tasks that remain visible and are never automatically archived; either marker means the user may archive the task manually.
+
+## 3. When and How to Use It
 
 ### Good use cases
 
@@ -116,34 +170,6 @@ The Skill selects the coordination language from the user's orchestration reques
 
 For example, an English request for a Chinese README keeps coordination in English while producing the README in Chinese.
 
-## 3. What You Will See
-
-After dispatch, the Codex task list forms a visible Controller and Worker group:
-
-```text
-👑 [R7K2] Tracking 3 Workers | Prepare the release
-├── ✍️ [R7K2-W1] Verify the installation flow
-├── ⌛️ [R7K2-W2] Implement the release script | Waiting for a target environment
-└── ✅ [R7K2-W3] Review safety boundaries
-```
-
-| Marker | Meaning |
-|---|---|
-| `👑` | The current task is the single Controller responsible for decisions, monitoring, acceptance, and synthesis |
-| `✍️` | The Worker is running, revising, or waiting for Controller acceptance |
-| `⌛️` | The Worker is blocked by a decision, clarification, permission, dependency, or failure |
-| `✅` | The Worker is complete and has passed Controller acceptance |
-
-You can expect:
-
-- An immediate dispatch report with Worker names, objectives, active and queued counts, concurrency limit, and execution location.
-- Worker messages when a task is accepted, reaches a substantive milestone, becomes blocked, or finishes.
-- Active monitoring by the Controller and timely reports of meaningful changes.
-- A paused affected Worker plus facts, options, and a recommendation when user input is required.
-- Independent Controller verification after a Worker reports `DONE`; `✅` appears only after acceptance.
-- Isolated worktrees for code-writing Workers by default, reducing concurrent-edit conflicts.
-- Completed tasks that remain visible and are never automatically archived.
-
 ## 4. How It Works
 
 ```mermaid
@@ -157,7 +183,8 @@ flowchart TD
     W2 -->|"BLOCKED"| C
     W3 -->|"ACCEPTED / PROGRESS / DONE"| C
     C -->|"User decision required"| U
-    C --> V["Controller acceptance and integration"]
+    C --> V["🔍 Controller acceptance and integration"]
+    C -->|"STOP / supersede"| X["🗑️ Retired Worker"]
     V --> R["Combined validation and final synthesis"]
 ```
 
@@ -169,7 +196,7 @@ The core workflow is:
 4. **Two-way coordination:** Workers send `ACCEPTED`, `PROGRESS`, `BLOCKED`, and `DONE`; the Controller also observes tasks through wait and read capabilities.
 5. **Blocker decisions:** Workers pause instead of guessing about product, architecture, permission, or risk decisions and send options back to the Controller.
 6. **Acceptance and integration:** The Controller checks deliverables and validation evidence. Code results are handed back in dependency order and validated together.
-7. **Completion without archiving:** Accepted Workers receive `✅`, all tasks remain visible, and the Controller delivers the final result.
+7. **Terminal state without automatic archiving:** Accepted Workers receive `✅`; cancelled or superseded Workers receive `🗑️`. Both are safe for manual archiving after the archive-readiness gate, but the Skill keeps them visible.
 
 ## 5. Safety Boundaries and Defaults
 
@@ -184,8 +211,9 @@ The core workflow is:
 | Commits and publishing | Do not commit, push, open PRs, or publish unless the original request authorizes it |
 | Permissions | Do not bypass approvals, sandboxes, credentials, or external-write restrictions |
 | Worker expansion | Workers may not create subagents, other tasks, or additional Workers |
-| Completion | A Worker `DONE` message requires Controller acceptance |
-| Automatic archiving | Prohibited; `✅` means complete, not archived |
+| Completion | A Worker `DONE` message enters `🔍`; Controller acceptance and result recovery are required for `✅` |
+| Retirement | Cancelled or superseded work receives `🗑️` only after useful-result disposition and replacement tracking |
+| Automatic archiving | Prohibited; `✅` and `🗑️` are terminal, manually archive-ready states |
 
 ## 6. Runtime Requirements and Compatibility
 

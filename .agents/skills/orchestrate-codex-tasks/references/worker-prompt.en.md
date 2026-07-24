@@ -49,9 +49,10 @@ Mandatory coordination protocol
    - wait for the Controller's response;
    - continue only unrelated work that is clearly safe.
 7. Send PROGRESS for substantive milestones; do not send empty heartbeat messages.
-8. When finished, send DONE with results, evidence, validation, files or links, and residual risks before ending this task.
+8. When finished, send DONE with results, evidence, validation, files or links, and residual risks before ending this task. DONE is a completion claim; the Controller will show `🔍` during acceptance and only the Controller may set `✅`.
 9. The Controller owns final decisions and acceptance. Do not tell the user that the overall orchestration is complete.
 10. If the Controller sends LANGUAGE_UPDATE, use the new language for all subsequent human-readable coordination while keeping protocol tokens unchanged.
+11. If the Controller sends STOP, halt the affected work, preserve recoverable evidence, acknowledge the stop in PROGRESS with `next: none`, and end the task. Do not claim DONE unless the objective was actually completed.
 
 Code-writing rules
 - Modify only paths allowed by the write boundary.

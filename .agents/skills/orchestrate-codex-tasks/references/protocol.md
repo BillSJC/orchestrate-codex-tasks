@@ -146,7 +146,7 @@ acceptanceDelta:
 - `REVISION`：验收失败，要求在原范围内修订。
 - `SCOPE_UPDATE`：用户已经授权范围变化。
 - `LANGUAGE_UPDATE`：用户明确要求切换协调语言。
-- `STOP`：用户明确停止，或原任务已失去价值。
+- `STOP`：用户明确停止，或原任务已失去价值；主控完成成果处置审计后进入 `RETIRED`。
 
 主控不能用 `SCOPE_UPDATE` 自行扩大用户授权，也不能把交付物语言变化误写成 `LANGUAGE_UPDATE`。
 
@@ -180,25 +180,29 @@ acceptanceDelta:
 
 ### 6.3 英文 Worker 标题
 
-以下三行依次对应 `RUNNING`、`BLOCKED` 和 `DONE`：
+以下五行依次对应 `RUNNING`、`REVIEW`、`BLOCKED`、`ACCEPTED` 和 `RETIRED`：
 
 ```text
 ✍️ [<runId>-<workerId>] <action phrase>
+🔍 [<runId>-<workerId>] <action phrase> | Awaiting Controller acceptance
 ⌛️ [<runId>-<workerId>] <action phrase> | <blocker summary>
 ✅ [<runId>-<workerId>] <action phrase>
+🗑️ [<runId>-<workerId>] <action phrase> | <retirement reason>
 ```
 
 ### 6.4 中文 Worker 标题
 
-以下三行依次对应 `RUNNING`、`BLOCKED` 和 `DONE`：
+以下五行依次对应 `RUNNING`、`REVIEW`、`BLOCKED`、`ACCEPTED` 和 `RETIRED`：
 
 ```text
 ✍️ [<runId>-<workerId>] <动宾短语>
+🔍 [<runId>-<workerId>] <动宾短语>｜等待主控验收
 ⌛️ [<runId>-<workerId>] <动宾短语>｜<阻塞摘要>
 ✅ [<runId>-<workerId>] <动宾短语>
+🗑️ [<runId>-<workerId>] <动宾短语>｜<废弃或取代原因>
 ```
 
-图标必须是第一个字符。Worker 不自行改名。
+图标必须是第一个字符。Worker 不自行改名。不得使用 `📋` 表达报告、审计、设计或“无合入物”；交付物类型写在标题后缀，生命周期通过验收后使用 `✅`。
 
 ### 6.5 状态映射
 
@@ -206,25 +210,47 @@ acceptanceDelta:
 |---|---|---|
 | `PROVISIONING` | 暂无或 `⌛️` | 只有 `clientThreadId`，等待真实任务 |
 | `RUNNING` | `✍️` | 正在执行或修订 |
+| `REVIEW` | `🔍` | Worker 已声明完成，主控正在验收或整合 |
 | `BLOCKED` | `⌛️` | 等待决定、澄清、权限、依赖或故障处理 |
-| `VALIDATING` | `✍️` | 主控正在验收，尚未确认完成 |
-| `DONE` | `✅` | 主控验收及必要组合验证通过 |
-| `STOPPED` | `⌛️` | 未完成而停止；标题后缀写明原因 |
+| `ACCEPTED` | `✅` | 成功完成、通过归档就绪门，可以人工归档 |
+| `RETIRED` | `🗑️` | 已取消、废弃、失效或被取代，通过归档就绪门，可以人工归档 |
 
 允许转换：
 
 ```text
 PROVISIONING -> RUNNING
-PROVISIONING -> STOPPED
+PROVISIONING -> RETIRED
 RUNNING -> BLOCKED
 BLOCKED -> RUNNING
-RUNNING -> VALIDATING
-VALIDATING -> RUNNING
-VALIDATING -> DONE
-RUNNING/BLOCKED -> STOPPED
+RUNNING -> REVIEW
+REVIEW -> RUNNING
+REVIEW -> BLOCKED
+REVIEW -> ACCEPTED
+PROVISIONING/RUNNING/REVIEW/BLOCKED -> RETIRED
 ```
 
-Worker 自称 `DONE` 只触发 `VALIDATING`。只有主控验收后才能进入 `DONE` 和 `✅`。
+Worker 自称 `DONE` 只触发 `REVIEW` 和 `🔍`。只有主控验收并通过归档就绪门后才能进入 `ACCEPTED` 和 `✅`。停止、取消或取代也必须通过归档就绪门，才能进入 `RETIRED` 和 `🗑️`。
+
+### 6.6 归档就绪门
+
+`ACCEPTED` 与 `RETIRED` 都是终态，并设置 `archiveReady=true`；两者都允许用户直接人工归档，但本 Skill 不自动调用归档工具。
+
+进入 `ACCEPTED` 前确认：
+
+1. 原 Prompt 范围已完成，主控验收和必要组合验证通过。
+2. 原范围要求的 Handoff 或合入已完成；原范围不要求合入时，报告、审计、设计、候选包等交付物已确认可访问。
+3. 没有待决策事项，也没有仅存在于临时 worktree 的必要未回收成果。
+4. 已记录 `terminalReason`。
+
+进入 `RETIRED` 前确认：
+
+1. 任务不再需要继续执行或等待。
+2. 替代任务存在时已记录 `replacementWorkerId`。
+3. 有价值成果已回收，或已明确记录不再采用。
+4. 没有仍需恢复的唯一未提交成果；否则保持 `BLOCKED`。
+5. 已记录 `terminalReason`。
+
+归档任务与删除分支、worktree 或文件是不同操作。`✅` 和 `🗑️` 都不授权自动清理。
 
 ## 7. 运行账本
 
@@ -247,6 +273,9 @@ Worker 自称 `DONE` 只触发 `VALIDATING`。只有主控验收后才能进入 
 | `lastSeq` | 已处理 Worker 消息序号 |
 | `cursor` | 等待工具 cursor |
 | `result` | 验收结果摘要 |
+| `archiveReady` | 仅 `ACCEPTED/RETIRED` 且归档就绪门通过时为 `true` |
+| `terminalReason` | 完成摘要或废弃原因 |
+| `replacementWorkerId` | 被取代时填写，否则 `none` |
 
 运行级保存：
 
@@ -257,7 +286,7 @@ Worker 自称 `DONE` 只触发 `VALIDATING`。只有主控验收后才能进入 
 | `controllerThreadId` | 主控 ID |
 | `controllerHostId` | 主控主机 |
 | `maxActiveWorkers` | 默认 8，用户可调 |
-| `activeCount` | 非 `DONE/STOPPED` 数量 |
+| `activeCount` | 非 `ACCEPTED/RETIRED` 数量 |
 | `queuedCount` | 未创建的规划任务数 |
 | `monitorGroups` | 每组最多 8 个 Worker |
 | `localPreferred` | 默认 `true` |
@@ -298,7 +327,7 @@ effective = min(requested, 值得独立派发且已就绪的任务数, 当前环
 3. 从运行账本恢复 `runLanguage`；账本缺失时，从主控标题和最近一条实质性用户请求恢复。
 4. 读取近期任务状态。
 5. 只接受比 `lastSeq` 更新的 Worker 消息。
-6. `DONE` 后的旧 `PROGRESS` 不回退状态。
+6. `ACCEPTED/RETIRED` 后的旧 `PROGRESS` 或 `DONE` 不回退状态。
 7. `REVISION` 保持相同 Worker ID，消息序号继续增加。
 8. 不因上下文丢失重复创建 Worker。
-9. 不因恢复、失败或停止而自动归档任何任务。
+9. 不因恢复、失败、完成或停止而自动归档任何任务；只恢复已有 `archiveReady` 值，不推断或自动执行归档。

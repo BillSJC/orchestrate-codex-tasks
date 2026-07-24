@@ -30,15 +30,17 @@
 4. 主控必须负责所有任务改名：
    - 主控：`👑`
    - Worker 运行中：`✍️`
+   - Worker 已声明完成、等待主控验收：`🔍`
    - Worker 等待确认或阻塞：`⌛️`
-   - Worker 已完成且通过主控验收：`✅`
+   - Worker 已完成、通过验收且可人工归档：`✅`
+   - Worker 已取消、废弃或被取代且可人工归档：`🗑️`
 5. 主控必须持续观察 Worker：
    - 派发完成后立即向用户汇报。
    - Worker 状态变化时及时汇报。
    - 出现阻塞时立即汇报。
    - 长时间无状态变化时也要周期性给出简短心跳。
 6. 主控必须验收 Worker 结果，而不能把 Worker 的“已完成”直接等价为总体任务完成。
-7. 本 Skill 严禁自动归档。Worker 完成后保留在任务列表中并维持 `✅` 标题；即使全部结果已经整合，也不得调用归档工具。
+7. 本 Skill 严禁自动归档。`✅` 与 `🗑️` 是通过归档就绪门的终态，表示用户可以人工归档；图标不触发归档、删除或 worktree 清理。
 8. 允许 Worker 写代码；凡是会修改项目文件的 Worker，默认创建在独立 worktree 中。
 9. 默认最多同时保留 8 个未完成 Worker；用户可以在每次运行开始前或运行期间明确调整该值。
 10. 支持本地和远程 `hostId`，但没有用户或环境上的特殊要求时优先选择本地主机。
@@ -100,7 +102,7 @@ OpenAI 官方 Codex App Server 文档定义了线程和轮次的底层生命周�
 
 这些 `codex_app.*` 名称是当前运行时工具契约，不应描述为面向外部开发者的稳定公共 API。Skill 在每次运行前都要确认工具是否可用；工具可能需要通过 `tool_search` 延迟发现。
 
-官方 App Server 虽然提供 `thread/archive`，当前 Codex App 也可能暴露 `set_thread_archived`，但它们不属于本 Skill 的工具集合。本 Skill 的硬性规则是永远不调用归档工具。
+官方 App Server 虽然提供 `thread/archive`，当前 Codex App 也可能暴露 `set_thread_archived`，但它们不属于自动编排工具集合。本 Skill 的硬性规则是永不自动归档；用户明确要求由 Codex 归档时，必须作为自动编排之外的独立、精确目标操作处理。
 
 ### 3.1 创建项目内 Worker
 
@@ -281,11 +283,11 @@ get_handoff_status({
 - 只在 Worker 已停止写入且主控完成单 Worker 验收后发起 Handoff。
 - Handoff 会中断仍在运行的目标任务，因此不能拿它充当普通消息或监控工具。
 - 回收前检查 Local 当前改动和其他已集成 Worker 的结果；发现覆盖或冲突风险时把 Worker 标记为 `⌛️`，先解决冲突。
-- Handoff 成功后在 Local 上重新运行组合验证；通过后才能把 Worker 标记为 `✅`。
+- Handoff 成功后在 Local 上重新运行组合验证；Worker 报告完成后先标记为 `🔍`，归档就绪门通过后才能标记为 `✅`。
 - 如果 Handoff 工具不可用，必须在派发写入型 Worker 前确定替代集成方案。替代方案可以是用户明确授权的本地提交/补丁交付，但不得自动推送远程仓库。
 - “允许写代码”不自动授权提交、推送、开 PR 或发布。除非用户的原始请求明确包含这些动作，否则 Worker 只修改并验证代码。
 
-Codex 托管 worktree 有独立的产品级清理策略。禁止归档意味着本 Skill 不调用归档工具，但不等于 Skill 能永久保留底层 worktree。因此，代码成果必须在标记 `✅` 前完成 Handoff、获得用户认可的持久化方式，或由用户明确接受成果暂时只存在于 worktree。
+Codex 托管 worktree 有独立的产品级清理策略。禁止自动归档不等于 Skill 能永久保留底层 worktree。因此，标记 `✅` 前必须完成原范围要求的 Handoff 或用户认可的持久化；标记 `🗑️` 前也必须回收仍有价值的成果，或明确记录不再采用。仍需恢复的唯一成果存在时只能保持 `⌛️`。
 
 ### 3.7 本地与远程主机
 
@@ -457,7 +459,7 @@ runId
 ### 7.1 默认并发度
 
 - `maxActiveWorkers` 默认值为 8。
-- “活跃”指尚未进入 `DONE` 或 `STOPPED` 的 Worker，包括 `PROVISIONING`、`RUNNING`、`BLOCKED` 和 `VALIDATING`。阻塞任务仍需主控持续管理，因此仍占一个槽位。
+- “活跃”指尚未进入 `ACCEPTED` 或 `RETIRED` 的 Worker，包括 `PROVISIONING`、`RUNNING`、`REVIEW` 和 `BLOCKED`。阻塞任务仍需主控持续管理，因此仍占一个槽位。
 - 用户可以在初始 Prompt 中明确设置其他正整数，也可以在运行期间升高或降低。
 - 当子任务多于并发槽位时，按依赖关系分波次派发。
 - 并发上限是容量上限，不是创建目标。只有 3 个真正独立的子任务时，即使上限为 8 也只创建 3 个 Worker。
@@ -577,11 +579,13 @@ Worker：
 
 ```text
 ✍️ [R7K2-W1] 核对线程工具契约
+🔍 [R7K2-W1] 核对线程工具契约｜等待主控验收
 ⌛️ [R7K2-W1] 核对线程工具契约｜等待权限确认
 ✅ [R7K2-W1] 核对线程工具契约
+🗑️ [R7K2-W1] 核对线程工具契约｜已由 W2 取代
 ```
 
-图标必须是标题的第一个字符，不在图标前增加其他标记。
+图标必须是标题的第一个字符，不在图标前增加其他标记。不得使用 `📋` 表达报告、审计、设计或“无合入物”；交付物类型写入后缀，生命周期验收通过后仍使用 `✅`。
 
 ### 8.2 Worker 状态转换
 
@@ -591,12 +595,14 @@ stateDiagram-v2
     PROVISIONING --> RUNNING: 获得 threadId 并完成改名
     RUNNING --> BLOCKED: 需要决策、澄清、授权或外部依赖
     BLOCKED --> RUNNING: 主控回复并解除阻塞
-    RUNNING --> VALIDATING: Worker 报告 DONE
-    VALIDATING --> RUNNING: 验收不通过，主控要求修订
-    VALIDATING --> DONE: 主控验收通过
-    PROVISIONING --> STOPPED: 用户取消或创建失败且不再重试
-    RUNNING --> STOPPED: 用户明确停止
-    BLOCKED --> STOPPED: 用户决定不再继续
+    RUNNING --> REVIEW: Worker 报告 DONE
+    REVIEW --> RUNNING: 验收不通过，主控要求修订
+    REVIEW --> BLOCKED: 验收需要外部决定或成果回收受阻
+    REVIEW --> ACCEPTED: 主控验收和归档就绪门通过
+    PROVISIONING --> RETIRED: 用户取消或创建失败且不再重试
+    RUNNING --> RETIRED: 用户明确停止且成果处置完成
+    REVIEW --> RETIRED: 结果不再采用且成果处置完成
+    BLOCKED --> RETIRED: 用户决定不再继续且成果处置完成
 ```
 
 标题映射：
@@ -605,14 +611,14 @@ stateDiagram-v2
 |---|---|---|
 | `PROVISIONING` | 暂无或 `⌛️` | 尚未获得真实 `threadId` |
 | `RUNNING` | `✍️` | 正在执行或修订 |
+| `REVIEW` | `🔍` | Worker 已声明完成，主控正在验收或整合 |
 | `BLOCKED` | `⌛️` | 等待确认、澄清、授权、依赖或故障处理 |
-| `VALIDATING` | `✍️` | 主控正在验收，尚未确认完成 |
-| `DONE` | `✅` | 主控验收通过；任务继续保留，不归档 |
-| `STOPPED` | `⌛️` | 已停止但未完成，标题后缀必须写明原因 |
+| `ACCEPTED` | `✅` | 成功完成并通过归档就绪门；可人工归档 |
+| `RETIRED` | `🗑️` | 已取消、废弃、失效或被取代，并通过归档就绪门；可人工归档 |
 
-Worker 自称完成后，主控先进入 `VALIDATING`；只有验收通过才改为 `✅`。
+Worker 自称完成后，主控先进入 `REVIEW` 并改为 `🔍`；只有验收、成果回收和归档就绪门通过才改为 `✅`。
 
-失败或停止不直接标记为 `✅`。无法自动恢复的失败归入 `⌛️`，由主控报告用户并决定修复、重试或停止；停止后的任务仍不自动归档。
+失败或停止不直接标记为 `✅`。仍需决定或恢复成果时使用 `⌛️`；确认停止、完成成果处置并记录替代关系后使用 `🗑️`。`✅` 与 `🗑️` 均不自动归档。
 
 ## 9. Worker Prompt 模板
 
@@ -656,9 +662,10 @@ Worker 自称完成后，主控先进入 `VALIDATING`；只有验收通过才改
    - 给出阻塞原因、已经确认的事实、可选方案、推荐方案和不决策的影响；
    - 等待主控回复。可以继续处理与阻塞无关且明确安全的工作。
 5. 有实质性里程碑时向主控发送 PROGRESS 消息，但不要发送无信息量心跳。
-6. 完成时必须先向主控发送 DONE 消息，包含结果、证据、验证、文件或链接、残余风险；发送后再结束本任务。
-7. 主控负责最终决策和验收。不要向主人宣称总体任务已经完成。
-8. 如果允许写代码：
+6. 完成时必须先向主控发送 DONE 消息，包含结果、证据、验证、文件或链接、残余风险；发送后再结束本任务。DONE 只是完成声明，主控验收期间使用 `🔍`。
+7. 收到 STOP 时停止受影响工作，保留可恢复证据，用 PROGRESS 和 `next: none` 确认停止；目标没有真正完成时不得声称 DONE。
+8. 主控负责最终决策、`✅/🗑️` 终态和归档就绪审计。不要向主人宣称总体任务已经完成。
+9. 如果允许写代码：
    - 只修改“文件写入边界”允许的路径；
    - 在独立 worktree 内完成实现与测试；
    - 不自行 Handoff 到 Local；
@@ -821,24 +828,27 @@ acceptanceDelta:
 
 收到 `DONE` 或观察到 Worker 结束后：
 
-1. 用 `read_thread` 核对完整结果和验证证据。
-2. 检查是否满足 Worker Prompt 中的验收条件。
-3. 不通过：
-   - 保持或恢复 `✍️`。
+1. 立即进入 `REVIEW` 并将 Worker 改名为 `🔍 ...｜等待主控验收`。
+2. 用 `read_thread` 核对完整结果和验证证据。
+3. 检查是否满足 Worker Prompt 中的验收条件。
+4. 不通过：
+   - 恢复 `RUNNING` 和 `✍️`。
    - 向 Worker 发送具体修订要求。
-4. 通过：
+5. 通过：
    - 只读成果直接记录到主控汇总。
    - 写入型成果按依赖顺序逐个 Handoff；跨主机时先转移到本地匹配项目。
    - 在 Local 上运行组合验证；Handoff 后出现整合冲突时改为 `⌛️`，由主控在 Local 解决或请求用户决定，不能让 Worker 无边界地继续修改 Local。
-   - 组合验证通过后才将 Worker 改名为 `✅`。
+   - 只有原范围完成、组合验证通过、必要成果已持久化、没有待决策或唯一未回收成果时，才通过归档就绪门并将 Worker 改名为 `✅`。
+   - 报告、审计、设计、DAG 或候选包本来不要求合入时，同样可通过验收并使用 `✅`，标题后缀可以说明“无合入物”。
    - 释放并发槽位，派发依赖已经满足的下一波 Worker。
-5. 所有 Worker 结果完成后，主控改名为：
+6. 用户取消、任务失效或 Worker 被取代时，先发送 `STOP` 并处置可恢复成果；记录 `replacementWorkerId`、`terminalReason` 和 `archiveReady=true` 后改为 `🗑️`。
+7. 所有 Worker 结果完成后，主控改名为：
 
    ```text
    👑 [runId] 汇总｜总体目标
    ```
 
-6. 主控独立验证整合结果，而不是只拼接 Worker 文本或只相信单个 worktree 的测试。
+8. 主控独立验证整合结果，而不是只拼接 Worker 文本或只相信单个 worktree 的测试。
 
 ### 阶段 F：完成并保留任务
 
@@ -854,10 +864,10 @@ acceptanceDelta:
    👑 [runId] 完成｜总体目标
    ```
 
-3. `✅` 只表示 Worker 已完成并通过验收，不表示系统会归档。
-4. 所有 `✅` Worker 必须继续保留在任务列表中。
-5. 本 Skill 在任何情况下都不得调用 `set_thread_archived` 或其他归档能力。
-6. 如果用户未来单独、明确要求归档，那是本次编排流程之外的独立操作，不能由本 Skill 预先代替用户决定。
+3. `✅` 表示成功完成，`🗑️` 表示取消、废弃或被取代；两者都已通过归档就绪门，可以由用户直接人工归档。
+4. 所有 `✅` 和 `🗑️` Worker 必须继续保留在任务列表中，直到用户人工归档或明确要求 Codex 对精确目标执行归档。
+5. 本 Skill 的自动编排流程不得调用 `set_thread_archived` 或其他归档能力。
+6. 归档与分支、worktree、文件删除是不同操作；终态图标不授权自动清理。
 
 ## 11. 主控运行账本
 
@@ -871,7 +881,7 @@ acceptanceDelta:
 | `clientThreadId` | worktree 尚在创建时的临时 ID |
 | `hostId` | Worker 所在主机 |
 | `title` | 期望标题 |
-| `state` | `PROVISIONING/RUNNING/BLOCKED/VALIDATING/DONE/STOPPED` |
+| `state` | `PROVISIONING/RUNNING/REVIEW/BLOCKED/ACCEPTED/RETIRED` |
 | `objective` | 子任务目标 |
 | `dependencies` | 前置 Worker |
 | `environment` | `local/worktree/projectless` |
@@ -881,13 +891,19 @@ acceptanceDelta:
 | `lastSeq` | 已处理的最新 Worker 消息序号 |
 | `cursor` | `wait_threads` 增量游标 |
 | `result` | 验收后的结果摘要 |
+| `archiveReady` | 仅归档就绪门通过后的 `ACCEPTED/RETIRED` 为 `true` |
+| `terminalReason` | 成功完成摘要或废弃原因 |
+| `replacementWorkerId` | 被取代时填写，否则为 `none` |
 
 运行级账本还必须保存：
 
 | 字段 | 含义 |
 |---|---|
+| `runLanguage` | 本次运行的协调语言，`en` 或 `zh-CN` |
+| `controllerThreadId` | 主控任务 ID |
+| `controllerHostId` | 主控所在主机；同主机且工具不要求时可省略 |
 | `maxActiveWorkers` | 当前有效并发上限，默认 8 |
-| `activeCount` | 所有非 `DONE/STOPPED` Worker 数 |
+| `activeCount` | 所有非 `ACCEPTED/RETIRED` Worker 数 |
 | `queuedCount` | 尚未创建且依赖未满足或等待槽位的 Worker 数 |
 | `monitorGroups` | 每组最多 8 个 Worker 的稳定监控分组 |
 | `localPreferred` | 固定为 `true`，除非用户明确指定远程优先 |
@@ -921,7 +937,7 @@ acceptanceDelta:
 
 - 按 `runId + workerId + seq` 去重。
 - 只接受比 `lastSeq` 更新的消息。
-- `DONE` 后收到旧 `PROGRESS` 不回退状态。
+- `ACCEPTED/RETIRED` 后收到旧 `PROGRESS` 或 `DONE` 不回退状态。
 - 主控发出修订后，可开启新的执行轮次，但仍沿用同一个 Worker ID 和递增序号。
 
 ### 12.4 标题更新失败
@@ -941,7 +957,7 @@ acceptanceDelta:
 
 - 主控先判断哪些 Worker 仍然有效。
 - 对需要调整的 Worker 发送结构化 `SCOPE_UPDATE` 指令；只有用户已经授权的新范围才能写入该消息。
-- 对已经失去价值的 Worker 发送 `STOP`，状态改为 `STOPPED`，标题保持 `⌛️` 并写明“已停止”。
+- 对已经失去价值的 Worker 发送 `STOP`。先回收仍有价值的成果、记录替代 Worker 和终止原因；归档就绪门通过后状态改为 `RETIRED`，标题使用 `🗑️`。
 - 更新主控标题和用户进度摘要。
 
 ### 12.7 worktree 起始状态不正确
@@ -949,7 +965,7 @@ acceptanceDelta:
 - 如果 Worker 创建后发现缺少必要的当前修改，立即发送 `BLOCKED`，不要在错误基线上继续实现。
 - 主控不得自动提交当前 checkout、复制整个未提交目录或重新创建多个重复 Worker。
 - 主控向用户说明默认分支、`working-tree` 和现有分支三个起始方案的差异。
-- 用户确认后最多重建 1 次该 Worker，并把旧任务标记为 `⌛️ ...｜基线错误，已停止`。
+- 用户确认后最多重建 1 次该 Worker；旧任务在确认没有待恢复的唯一成果并记录替代 Worker 后标记为 `🗑️ ...｜基线错误，已由 <workerId> 取代`。
 
 ### 12.8 Handoff 冲突或失败
 
@@ -1125,7 +1141,30 @@ $HOME/.agents/skills/orchestrate-codex-tasks/
 
 用户也可以把 GitHub 仓库中的 Skill 目录复制到该位置。Codex 支持符号链接，因此开发者可以保留本地 Git clone，并从用户级 Skill 目录链接到 clone 中的 Skill。
 
-### 14.5 安装后触发
+### 14.5 更新现有安装
+
+Codex 会自动检测 Skill 文件变化；如果更新没有出现，重启 Codex。更新方式取决于安装范围：
+
+1. **仓库级副本**：更新包含 `.agents/skills/orchestrate-codex-tasks` 的仓库 checkout。
+2. **`$skill-installer` 用户级副本**：内置安装器在目标目录已存在时会停止，不能直接覆盖。先把旧副本移动到所有 Skill 扫描目录之外的备份位置，再从同一 GitHub URL 重新安装。
+3. **手动用户级副本**：更新 `$HOME/.agents/skills/orchestrate-codex-tasks` 指向的内容或符号链接。
+
+安装器使用 `$CODEX_HOME/skills`，通常是 `$HOME/.codex/skills`；官方手动发现目录还包括 `$HOME/.agents/skills`。更新前必须确认实际生效副本，避免在两个位置留下不同版本。
+
+推荐用户发送：
+
+```text
+请安全更新用户级 $orchestrate-codex-tasks 安装。
+把现有副本移动到所有 Skill 扫描目录之外的备份位置，不要删除。
+然后使用 $skill-installer 从下面的地址重新安装：
+https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/orchestrate-codex-tasks
+确认没有旧的同名用户级副本仍可被发现。
+不要创建任何 Worker。
+```
+
+备份不能继续放在 `.agents/skills`、`$HOME/.agents/skills` 或 `$CODEX_HOME/skills` 内，因为 Codex 不合并同名 Skill；重复副本可能同时出现并使用不同指令。新任务验证通过后，再由用户决定是否删除扫描路径之外的备份。
+
+### 14.6 安装后触发
 
 安装后的确定性测试方式：
 
@@ -1146,7 +1185,7 @@ $HOME/.agents/skills/orchestrate-codex-tasks/
 - 两个 Worker 标题为 `✍️`。
 - Prompt 中都含有正确主控 `threadId`。
 - Worker 发送 `DONE`。
-- 主控验收后改为 `✅` 并汇总。
+- 主控先改为 `🔍`，验收和归档就绪门通过后改为 `✅` 并汇总。
 
 ### 场景 2：Worker 需要用户决策
 
@@ -1159,9 +1198,9 @@ $HOME/.agents/skills/orchestrate-codex-tasks/
 ### 场景 3：Worker 完成但验收失败
 
 - Worker 发送 `DONE`。
-- 主控不立即改为 `✅`。
+- 主控先改为 `🔍`，不立即改为 `✅`。
 - 主控发现验证不足，发送修订要求。
-- Worker 修订通过后才改为 `✅`。
+- Worker 恢复为 `✍️`，修订通过后再次进入 `🔍`，最终才改为 `✅`。
 
 ### 场景 4：跨任务消息工具不可用
 
@@ -1190,7 +1229,8 @@ $HOME/.agents/skills/orchestrate-codex-tasks/
 ### 场景 8：用户中途改需求
 
 - 主控向相关 Worker 发送调整指令。
-- 停止已经无价值的工作流。
+- 对已经无价值的工作流发送 `STOP`。
+- 回收有价值成果并记录替代关系后改为 `🗑️`。
 - 向用户报告影响和新的并发计划。
 
 ### 场景 9：写代码 Worker 的默认隔离与回收
@@ -1198,7 +1238,7 @@ $HOME/.agents/skills/orchestrate-codex-tasks/
 - 两个写代码 Worker 都以独立 `worktree` 创建，而不是共享 `local`。
 - Prompt 分别声明文件边界和成果回收方式。
 - Worker 在各自 worktree 完成测试并发送 `DONE`。
-- 主控逐个验收和 Handoff，在 Local 运行组合测试后才标记 `✅`。
+- 主控先标记 `🔍`，逐个验收和 Handoff，在 Local 运行组合测试并通过归档就绪门后才标记 `✅`。
 - 整个过程不自动提交、推送或归档。
 
 ### 场景 10：任务依赖未提交修改
@@ -1248,6 +1288,27 @@ $HOME/.agents/skills/orchestrate-codex-tasks/
 - README 交付物使用英文，不触发协调语言切换。
 - 只有用户明确要求“后续请用英文协调”时，主控才发送 `LANGUAGE_UPDATE`。
 
+### 场景 17：无合入物任务完成
+
+- Worker 交付只读审计、报告、设计或 DAG，并发送 `DONE`。
+- 主控进入 `🔍`，核对内容、证据和可访问路径。
+- 原 Prompt 不要求代码或合入；验收通过后标记为 `✅ ...｜已验收，无合入物`。
+- 不使用 `📋`，用户可以直接人工归档该任务。
+
+### 场景 18：Worker 被替代
+
+- 原 Worker 因不可恢复故障或目标变化失去价值。
+- 主控发送 `STOP`，回收有价值成果，并记录 `replacementWorkerId`。
+- 仍有唯一未提交成果待恢复时保持 `⌛️`，不得提前终止。
+- 成果处置完成后标记为 `🗑️ ...｜已由 <workerId> 取代`，用户可以直接人工归档。
+
+### 场景 19：终态任务的人工归档
+
+- `✅` 与 `🗑️` 的账本都包含 `archiveReady=true` 和 `terminalReason`。
+- Skill 不自动调用归档工具。
+- 用户自行点击归档，或另行明确要求 Codex 归档精确目标时，可以直接归档。
+- 归档不会被当作删除分支、worktree 或文件的授权。
+
 ## 16. 完成标准
 
 Skill 实现完成后，应满足：
@@ -1260,17 +1321,20 @@ Skill 实现完成后，应满足：
 - 英文请求的主控回复、标题、Worker 消息和汇总使用英文；中文请求对应使用中文。
 - 交付物语言不反向改变协调语言；显式语言切换能够传播到所有活跃 Worker。
 - 每个任务标题始终符合图标状态规则。
+- `✍️/🔍/⌛️/✅/🗑️` 分别映射运行、验收、阻塞、成功终态和废弃终态；不使用 `📋` 表达交付物类型。
 - 每个阻塞都能进入主控并被用户看见。
 - 主控同时使用 Worker 消息和主动监控。
-- Worker 的 `DONE` 必须经过主控验收。
+- Worker 的 `DONE` 必须先进入 `REVIEW` 和 `🔍`，再经过主控验收。
 - 写代码 Worker 默认位于独立 worktree，并具备明确文件所有权。
-- worktree 成果经过串行 Handoff 和 Local 组合验证后才标记 `✅`。
+- worktree 成果经过串行 Handoff、Local 组合验证和归档就绪门后才标记 `✅`。
+- 无合入物任务按原 Prompt 验收通过后同样标记 `✅`。
+- 取消、废弃或被取代的任务只有在成果处置、替代记录和归档就绪门通过后才标记 `🗑️`。
 - 默认 `maxActiveWorkers` 为 8，用户可以在运行前或运行中调整。
 - 超过 8 个活跃 Worker 时，监控分组仍覆盖全部 Worker。
 - 远程 Worker 正确记录和传递 `hostId`，且本地主机保持默认优先级。
 - 主控在运行期间不让用户超过约 60 秒看不到任何有意义的进度信息。
 - 最终结果由主控整合并独立验证。
-- 全部完成后任务仍保留；任何路径都不调用归档工具。
+- 全部完成后任务仍保留；自动编排不调用归档工具，`✅/🗑️` 表示用户可以人工归档。
 
 ## 17. 推荐默认值
 
@@ -1291,8 +1355,10 @@ Skill 实现完成后，应满足：
 | `wait_threads` 等待窗口 | 约 30 秒 |
 | 用户进度心跳 | 最长约 60 秒 |
 | Worker 自动重建 | 同一失败最多 1 次 |
-| Worker 完成标识 | 主控验收后 `✅` |
-| 自动归档 | 严禁；本 Skill 永不调用归档工具 |
+| Worker 验收中标识 | Worker `DONE` 后、主控验收期间使用 `🔍` |
+| Worker 成功终态 | 归档就绪门通过后使用 `✅`，可以人工归档 |
+| Worker 废弃终态 | 成果处置和替代记录完成后使用 `🗑️`，可以人工归档 |
+| 自动归档 | 严禁；自动编排不调用归档工具 |
 | 决策中心 | 仅主控 |
 
 该默认方案使用 8 个槽位提高吞吐量，同时用 worktree 隔离、单组监控、串行成果回收和主控验收控制冲突。
@@ -1306,8 +1372,10 @@ Skill 实现完成后，应满足：
 3. 只对非常明确的独立 Codex 任务并发意图进行隐式识别；弱并发信号只提出建议，不创建任务。
 4. 支持远程 `hostId`，但默认优先本地主机。
 5. `maxActiveWorkers` 默认 8，用户可以在运行前或运行中主动调整。
-6. Worker 完成后使用 `✅`，但永不自动归档。
-7. 英文请求使用英文协调，中文请求使用中文协调；交付物语言与协调语言独立。
+6. Worker 的 `DONE` 先使用 `🔍`；成功终态使用 `✅`，废弃或被取代的终态使用 `🗑️`。
+7. `✅` 与 `🗑️` 都表示任务已完成归档就绪审计、可以人工归档，但永不自动归档。
+8. 无合入物不使用独立图标；报告、审计、设计或候选包通过原范围验收后同样使用 `✅`。
+9. 英文请求使用英文协调，中文请求使用中文协调；交付物语言与协调语言独立。
 
 当前没有阻塞第一版建设的待确认项。运行时出现的基线选择、远程项目歧义、额外权限或成果回收冲突，均由 Skill 的预检和 `BLOCKED` 协议处理，不需要在设计阶段预先猜测。
 
@@ -1318,7 +1386,7 @@ Skill 实现完成后，应满足：
 1. 使用官方 `skill-creator` 的初始化脚本，在仓库内创建 `.agents/skills/orchestrate-codex-tasks/`。
 2. 编写精简的 `SKILL.md`：
    - frontmatter 只包含 `name` 和严格触发范围的 `description`；
-   - 正文保留预检、六阶段调度、8 并发默认值、worktree 优先、本地优先、阻塞汇报和禁止归档等核心规则；
+   - 正文保留预检、六阶段调度、8 并发默认值、worktree 优先、本地优先、阻塞汇报、终态归档就绪门和禁止自动归档等核心规则；
    - 正文控制在 500 行以内。
 3. 将详细工具契约、Handoff、远程主机和异常恢复放入 `references/tool-contracts.md`。
 4. 将双向消息格式、双语标题状态机、语言切换和恢复规则放入 `references/protocol.md`。
@@ -1329,12 +1397,12 @@ Skill 实现完成后，应满足：
    - 全仓只使用 `Prompt` 术语；
    - 默认并发值必须为 8；
    - 不出现 `spawn_agent` 调度路径；
-   - 不出现任何肯定式归档调用指令；归档工具只能出现在禁止规则中；
+   - 不出现任何自动归档调用指令；只允许说明 `✅/🗑️` 可由用户人工归档，以及用户另行明确要求后的精确归档操作；
    - 写代码默认环境必须为 `worktree`；
    - 每个 Worker Prompt 必须要求回传主控并包含主控 `threadId`。
    - 英文和中文 Worker Prompt 必须包含相同的协议枚举、安全边界和消息字段。
    - README.md 与 README.zh-CN.md 必须互相链接。
 9. 对第 15 节场景做无副作用的结构化演练。
-10. 只有用户明确要求进行真实端到端测试时，才实际创建独立 Worker 任务；测试完成后同样只标记 `✅`，不归档。
+10. 只有用户明确要求进行真实端到端测试时，才实际创建独立 Worker 任务；测试完成后按结果标记 `✅` 或 `🗑️`，不自动归档。
 
 以上步骤完成并通过校验后，第一版即可发布到 GitHub 并通过 `$skill-installer` 安装。
