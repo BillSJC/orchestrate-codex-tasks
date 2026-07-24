@@ -2,7 +2,7 @@
 
 # Codex Task Orchestrator
 
-`orchestrate-codex-tasks` 是一个 Codex Skill。它把当前任务作为唯一主控（Controller），创建多个可在任务列表中独立存在的 Worker 任务，并通过跨任务消息完成派发、阻塞处理、验收和结果汇总。
+`orchestrate-codex-tasks` 是一个 Codex Skill。它把当前任务作为唯一主控（Controller），创建多个可在任务列表中独立存在的 Worker 任务，并通过跨任务消息与本地持久化 SQLite 账本完成派发、阻塞处理、验收、恢复和结果汇总。
 
 > Worker 是独立 Codex 任务，不是 Codex 子 Agent。
 
@@ -35,6 +35,8 @@
 - 派发后立即收到 Worker 名称、目标、活跃数、排队数、并发上限和运行位置。
 - Worker 在接受任务、取得实质进展、发生阻塞和完成时通知主控。
 - 主控持续观察全部活跃 Worker，并及时汇报关键变化。
+- 项目中会建立私有且被 Git 忽略的 `.codex/runtime/orchestrate-codex-tasks/` SQLite 运行账本；任务计划、地址、序号、cursor、决定和验收状态不会只依赖主控上下文。
+- 任务创建、跨任务消息、改名和 Handoff 都记录幂等 operation；工具调用结果含糊时先核对事实，不会静默重复创建或发送。
 - 需要用户决定时，受影响的 Worker 暂停，主控给出事实、选项和建议。
 - 主控区分“消息频繁”和“有效里程碑关闭”；Worker 过重、重复或过慢时，先请求安全 checkpoint。
 - 主控可以在不降低验收标准的前提下批量授权已核对的测试 manifest、删除冗余执行，或拆分独立剩余工作。
@@ -57,6 +59,8 @@ https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/or
 ```
 
 安装完成后，在新的任务中使用 `$orchestrate-codex-tasks`。如果 Skill 没有立即出现，重启 Codex 后再检查。
+
+安装器会连同 Skill 一起复制 Python 调度/账本 CLI 和 SQL schema，不需要第三方 Python 包。
 
 可以用下面的 Prompt 做一次无副作用确认：
 
@@ -137,6 +141,8 @@ https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/or
 使用主控 + Worker 模式，由当前任务通过跨任务消息统一协调。
 ```
 
+主控会在项目内创建私有、被 Git 忽略的运行账本。不要把凭据、token、私钥或未经最小化的敏感工具输出写入编排请求或调度 manifest。
+
 ### 设置并发度
 
 默认最多有 8 个活跃 Worker，但不会为了填满 8 个槽位而制造无意义任务。可以在开始时指定其他上限：
@@ -178,13 +184,15 @@ Skill 会根据触发编排的用户请求选择协调语言：
 ```mermaid
 flowchart TD
     U["用户"] --> C["👑 主控任务"]
-    C --> P["拆解目标、依赖与文件边界"]
+    C --> L["本地 SQLite 账本<br/>manifest、状态、序号、cursor、operation"]
+    C --> P["校验 DAG、里程碑、环境与文件边界"]
     P --> W1["✍️ Worker 1"]
     P --> W2["✍️ Worker 2"]
     P --> W3["✍️ Worker N"]
     W1 -->|"ACCEPTED / PROGRESS / DONE"| C
     W2 -->|"BLOCKED"| C
     W3 -->|"ACCEPTED / PROGRESS / DONE"| C
+    C -->|"intent → tool → outcome"| L
     W1 -->|"里程碑不再关闭"| H["主控效率审查"]
     H -->|"CHECKPOINT / REPLAN"| W1
     C -->|"需要用户决策"| U
@@ -197,12 +205,14 @@ flowchart TD
 
 1. **授权判断**：只有显式调用 Skill，或用户明确要求“独立任务并发”“主控 + Worker”等模式时，才允许创建 Worker。
 2. **语言与寻址**：主控确定 `runLanguage`，生成运行标识，并取得自己的 `threadId`；跨主机时同时记录 `hostId`。
-3. **拆解与派发**：主控将工作整理成带依赖关系的子任务，选择匹配语言的 Worker Prompt，并写入范围、禁止事项、文件边界和验收条件。
-4. **双向协调**：Worker 使用 `ACCEPTED`、`PROGRESS`、`BLOCKED` 和 `DONE` 消息主动回报；主控同时通过任务等待和读取能力主动观察。
-5. **健康与重规划**：主控跟踪已关闭验收项、范围增长、逐步放行往返、timeout 和一对一长尾。触发软阈值时先 `CHECKPOINT`，必要时执行有界 `REPLAN`。
-6. **阻塞决策**：Worker 不自行猜测产品、架构、权限或风险决策，而是暂停受影响工作并把选项发回主控。
-7. **验收与回收**：主控核对交付物和测试证据。代码成果按依赖顺序回收到本地，并完成组合验证。
-8. **终态但不自动归档**：通过验收的 Worker 标记为 `✅`，取消或被取代的 Worker 标记为 `🗑️`。两者通过归档就绪门后都可以人工归档，但 Skill 继续保留任务。
+3. **持久化规划**：确定性 CLI 校验并编译 Worker DAG、worktree 策略、里程碑、验收和写边界，主控再把清单原子激活到本地 SQLite 账本。
+4. **幂等派发**：创建任务、发消息、改标题或启动 Handoff 前先记录 intent；实际 Codex 工具调用后，只保存清理过的 outcome。
+5. **双向协调**：Worker 使用 `ACCEPTED`、`PROGRESS`、`BLOCKED` 和 `DONE` 主动回报；主控也主动等待和读取，并持久化每条有效消息与 cursor。
+6. **健康与重规划**：主控跟踪已关闭验收项、范围增长、逐步放行往返、timeout 和一对一长尾。触发软阈值时先 `CHECKPOINT`，必要时执行有界 `REPLAN`。
+7. **阻塞决策**：Worker 不自行猜测产品、架构、权限或风险决策，而是暂停受影响工作并把选项发回主控。
+8. **验收与回收**：主控核对交付物和测试证据。代码成果按依赖顺序回收到本地，并完成组合验证。
+9. **恢复**：上下文压缩或重启后，主控先验证账本、核对 pending operation 与可见任务事实、恢复当前 manifest，再继续调度，不重复创建 Worker。
+10. **终态但不自动归档**：通过验收的 Worker 标记为 `✅`，取消或被取代的 Worker 标记为 `🗑️`。两者通过归档就绪门后都可以人工归档，但 Skill 继续保留任务。
 
 ## 5. 安全边界与默认策略
 
@@ -211,6 +221,8 @@ flowchart TD
 | Worker 类型 | 独立 Codex 任务，不是子 Agent |
 | 协调语言 | 匹配触发编排的用户请求，支持英文和中文 |
 | 决策中心 | 只有主控可以处理范围、冲突和最终验收 |
+| 持久状态 | 私有本地 SQLite 账本，只有主控写入 |
+| 外部副作用 | 幂等 `intent → 实际工具 → 清理后的 outcome` |
 | 最大活跃 Worker | 默认 8，用户可以在运行前或运行中调整 |
 | 代码写入 | 优先使用独立 worktree，并声明文件边界 |
 | 主机选择 | 本地主机优先，也支持明确的远程 `hostId` |
@@ -223,7 +235,23 @@ flowchart TD
 | 废弃标准 | 取消或被取代的任务只有在成果处置和替代关系记录后才能标记 `🗑️` |
 | 自动归档 | 严禁；`✅` 和 `🗑️` 都是可人工归档的终态 |
 
-## 6. 运行要求与兼容性
+## 6. 本地账本、恢复与隐私
+
+项目运行的默认数据库位置是：
+
+```text
+<project>/.codex/runtime/orchestrate-codex-tasks/runs/<runId>/ledger.sqlite3
+```
+
+初始化器会把运行目录加入仓库本地的 `.git/info/exclude`，不会修改受版本控制的 `.gitignore`。账本和备份必须留在本地，不能被自动提交或上传。
+
+只有主控通过内置 `ledger.py` 写数据库。Worker 不访问账本，只通过结构化跨任务消息报告。账本保存规范化 task、生命周期与健康度、稳定 ID、消息序号、等待 cursor、决定、整合状态和 append-only 事件轨迹。operation request/outcome 使用封闭且最小化的字段集合；校验会检查 SQLite integrity、foreign key、revision、内容哈希、地址、序号和终态不变量。脚本会拒绝明显的密钥字段和值，但这只是最后防线，不代表可以保存原始凭据或日志。
+
+恢复时，主控先执行完整性、状态、pending operation 和观察事实核对，再继续运行。账本无法安全初始化时不会派发 Worker；运行中账本写入失败时会停止新的外部副作用、报告降级状态，并在核对或恢复已验证备份后继续。
+
+## 7. 运行要求与兼容性
+
+脚本需要 Python 3.9 或更高版本以及标准库 `sqlite3`，没有第三方包依赖。
 
 当前 Codex 表面需要提供：
 
@@ -236,7 +264,7 @@ flowchart TD
 
 运行时暴露的工具名称和参数可能随 Codex 版本变化。Skill 会优先使用当前实际工具 schema，仓库中的工具契约用于说明预期能力和降级边界。
 
-## 7. 项目结构与进一步阅读
+## 8. 项目结构与进一步阅读
 
 ```text
 .agents/
@@ -245,14 +273,24 @@ flowchart TD
         ├── SKILL.md
         ├── agents/
         │   └── openai.yaml
-        └── references/
-            ├── protocol.md
-            ├── tool-contracts.md
-            ├── worker-prompt.en.md
-            └── worker-prompt.zh-CN.md
+        ├── references/
+        │   ├── dispatch.md
+        │   ├── ledger.md
+        │   ├── protocol.md
+        │   ├── tool-contracts.md
+        │   ├── worker-prompt.en.md
+        │   └── worker-prompt.zh-CN.md
+        └── scripts/
+            ├── dispatch.py
+            ├── ledger.py
+            ├── orchestration_common.py
+            └── sql/
+                └── 001_initial.sql
 ```
 
 - [详细设计](DESIGN.md)
 - [Skill 主流程](.agents/skills/orchestrate-codex-tasks/SKILL.md)
 - [Controller/Worker 协议](.agents/skills/orchestrate-codex-tasks/references/protocol.md)
 - [独立任务工具契约](.agents/skills/orchestrate-codex-tasks/references/tool-contracts.md)
+- [调度清单与渲染脚本](.agents/skills/orchestrate-codex-tasks/references/dispatch.md)
+- [本地持久化运行账本](.agents/skills/orchestrate-codex-tasks/references/ledger.md)

@@ -2,7 +2,7 @@
 
 # Codex Task Orchestrator
 
-`orchestrate-codex-tasks` is a Codex Skill that turns the current task into the single Controller, creates independently visible Worker tasks, and coordinates dispatch, blockers, acceptance, and result synthesis through cross-task messages.
+`orchestrate-codex-tasks` is a Codex Skill that turns the current task into the single Controller, creates independently visible Worker tasks, and coordinates dispatch, blockers, acceptance, recovery, and result synthesis through cross-task messages and a durable local SQLite ledger.
 
 > Workers are independent Codex tasks, not Codex subagents.
 
@@ -35,6 +35,8 @@ You can expect:
 - An immediate dispatch report with Worker names, objectives, active and queued counts, concurrency limit, and execution location.
 - Worker messages when a task is accepted, reaches a substantive milestone, becomes blocked, or finishes.
 - Active monitoring by the Controller and timely reports of meaningful changes.
+- A private SQLite run ledger under the project’s ignored `.codex/runtime/orchestrate-codex-tasks/` directory, so task plans, addresses, sequence numbers, cursors, decisions, and acceptance state survive context compaction.
+- Idempotent operation tracking around task creation, cross-task messages, title changes, and Handoff, preventing an ambiguous timeout from silently creating or sending the same work twice.
 - A paused affected Worker plus facts, options, and a recommendation when user input is required.
 - Health checks that distinguish useful milestone closure from frequent messages, then request a safe checkpoint when a Worker becomes too broad, repetitive, or slow.
 - Adaptive replanning that can batch-authorize a reviewed test manifest, remove redundant execution, or split independent remaining work without weakening acceptance.
@@ -57,6 +59,8 @@ https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/or
 ```
 
 Use `$orchestrate-codex-tasks` in a new task after installation. If the Skill does not appear immediately, restart Codex and check again.
+
+The installer copies the bundled Python dispatch/ledger CLIs and SQL schema with the Skill. No third-party Python package is required.
 
 You can confirm the installation without creating Workers:
 
@@ -138,6 +142,8 @@ Create several independent Codex tasks to complete this work in parallel.
 Use a Controller + Worker workflow and coordinate them through cross-task messages.
 ```
 
+The Controller will create a private, Git-ignored runtime ledger in the project. Do not put credentials, tokens, private keys, or raw sensitive tool output in the orchestration request or dispatch manifest.
+
 ### Set the concurrency limit
 
 The default limit is 8 active Workers, but the Skill does not create low-value tasks merely to fill all 8 slots. Set another limit when starting:
@@ -179,13 +185,15 @@ For example, an English request for a Chinese README keeps coordination in Engli
 ```mermaid
 flowchart TD
     U["User"] --> C["👑 Controller task"]
-    C --> P["Select language and split goals, dependencies, and file boundaries"]
+    C --> L["Local SQLite ledger<br/>manifest, state, seq, cursor, operations"]
+    C --> P["Validate DAG, milestones, environments, and write boundaries"]
     P --> W1["✍️ Worker 1"]
     P --> W2["✍️ Worker 2"]
     P --> W3["✍️ Worker N"]
     W1 -->|"ACCEPTED / PROGRESS / DONE"| C
     W2 -->|"BLOCKED"| C
     W3 -->|"ACCEPTED / PROGRESS / DONE"| C
+    C -->|"intent → tool → outcome"| L
     W1 -->|"Milestones stop closing"| H["Controller health review"]
     H -->|"CHECKPOINT / REPLAN"| W1
     C -->|"User decision required"| U
@@ -198,12 +206,14 @@ The core workflow is:
 
 1. **Authorization gate:** Workers are created only after explicit Skill invocation or a clear request for independent-task concurrency or a Controller + Worker workflow.
 2. **Language and addressing:** The Controller selects `runLanguage`, generates a run ID, and resolves its own `threadId`; cross-host runs also record `hostId`.
-3. **Decomposition and dispatch:** The Controller builds dependency-aware subtasks, selects the matching Worker Prompt language, and injects scope, prohibitions, file boundaries, and acceptance criteria.
-4. **Two-way coordination:** Workers send `ACCEPTED`, `PROGRESS`, `BLOCKED`, and `DONE`; the Controller also observes tasks through wait and read capabilities.
-5. **Health and replanning:** The Controller tracks closed acceptance items, scope growth, serial decision round trips, timeouts, and one-to-one tail work. Soft thresholds cause `CHECKPOINT`, then a bounded `REPLAN` when useful.
-6. **Blocker decisions:** Workers pause instead of guessing about product, architecture, permission, or risk decisions and send options back to the Controller.
-7. **Acceptance and integration:** The Controller checks deliverables and validation evidence. Code results are handed back in dependency order and validated together.
-8. **Terminal state without automatic archiving:** Accepted Workers receive `✅`; cancelled or superseded Workers receive `🗑️`. Both are safe for manual archiving after the archive-readiness gate, but the Skill keeps them visible.
+3. **Durable planning:** A deterministic CLI validates and compiles the Worker DAG, worktree policy, milestones, acceptance criteria, and write boundaries; the Controller atomically activates it in the local SQLite ledger.
+4. **Idempotent dispatch:** Before creating a task, sending a message, changing a title, or starting Handoff, the Controller records an intent. It records the sanitized outcome only after calling the real Codex tool.
+5. **Two-way coordination:** Workers send `ACCEPTED`, `PROGRESS`, `BLOCKED`, and `DONE`; the Controller also observes tasks through wait and read capabilities and persists each accepted message and cursor.
+6. **Health and replanning:** The Controller tracks closed acceptance items, scope growth, serial decision round trips, timeouts, and one-to-one tail work. Soft thresholds cause `CHECKPOINT`, then a bounded `REPLAN` when useful.
+7. **Blocker decisions:** Workers pause instead of guessing about product, architecture, permission, or risk decisions and send options back to the Controller.
+8. **Acceptance and integration:** The Controller checks deliverables and validation evidence. Code results are handed back in dependency order and validated together.
+9. **Recovery:** After context compaction or restart, the Controller verifies the ledger, reconciles pending operations with visible task facts, restores the current manifest, and resumes without duplicating Workers.
+10. **Terminal state without automatic archiving:** Accepted Workers receive `✅`; cancelled or superseded Workers receive `🗑️`. Both are safe for manual archiving after the archive-readiness gate, but the Skill keeps them visible.
 
 ## 5. Safety Boundaries and Defaults
 
@@ -212,6 +222,8 @@ The core workflow is:
 | Worker type | Independent Codex task, not a subagent |
 | Coordination language | Matches the user's orchestration request; English and Chinese are supported |
 | Decision authority | The Controller owns scope, conflicts, and final acceptance |
+| Durable state | Private local SQLite ledger; Controller is the sole writer |
+| External side effects | Idempotent `intent → actual tool → sanitized outcome` |
 | Maximum active Workers | 8 by default; adjustable before or during a run |
 | Code writes | Prefer isolated worktrees with explicit file boundaries |
 | Host selection | Prefer local execution; support an explicit remote `hostId` |
@@ -224,7 +236,23 @@ The core workflow is:
 | Retirement | Cancelled or superseded work receives `🗑️` only after useful-result disposition and replacement tracking |
 | Automatic archiving | Prohibited; `✅` and `🗑️` are terminal, manually archive-ready states |
 
-## 6. Runtime Requirements and Compatibility
+## 6. Local Ledger, Recovery, and Privacy
+
+For a project run, the default database is:
+
+```text
+<project>/.codex/runtime/orchestrate-codex-tasks/runs/<runId>/ledger.sqlite3
+```
+
+The initializer adds the runtime directory to the repository-local `.git/info/exclude`; it does not modify the tracked `.gitignore`. The ledger and its backups must stay local and must never be committed or uploaded automatically.
+
+Only the Controller writes the database through the bundled `ledger.py`. Workers cannot access it and report through structured cross-task messages instead. The database stores normalized task specifications, lifecycle and health state, stable IDs, message sequences, wait cursors, decisions, integration status, and an append-only event trail. Operation requests and outcomes use closed, minimal field sets; verification checks SQLite integrity, foreign keys, revisions, hashes, addresses, sequences, and terminal-state invariants. It deliberately rejects secret-like keys and values, but that is a final safeguard—not permission to persist raw credentials or logs.
+
+On recovery, the Controller runs ledger integrity, status, pending-operation, and observed-task audits before doing more work. If the ledger cannot be safely initialized, it does not dispatch Workers. If a ledger write fails mid-run, it stops new external side effects, reports degraded state, and reconciles or restores a verified backup before resuming.
+
+## 7. Runtime Requirements and Compatibility
+
+The scripts require Python 3.9 or newer with the standard-library `sqlite3` module. They have no third-party package dependency.
 
 The active Codex surface must support:
 
@@ -237,7 +265,7 @@ If a preflight check finds that a required capability is missing, the Skill stop
 
 Runtime tool names and schemas may change between Codex versions. The Skill uses the actual callable schema first; the bundled tool contract documents expected capabilities and safe fallback boundaries.
 
-## 7. Project Structure and Further Reading
+## 8. Project Structure and Further Reading
 
 ```text
 .agents/
@@ -246,14 +274,24 @@ Runtime tool names and schemas may change between Codex versions. The Skill uses
         ├── SKILL.md
         ├── agents/
         │   └── openai.yaml
-        └── references/
-            ├── protocol.md
-            ├── tool-contracts.md
-            ├── worker-prompt.en.md
-            └── worker-prompt.zh-CN.md
+        ├── references/
+        │   ├── dispatch.md
+        │   ├── ledger.md
+        │   ├── protocol.md
+        │   ├── tool-contracts.md
+        │   ├── worker-prompt.en.md
+        │   └── worker-prompt.zh-CN.md
+        └── scripts/
+            ├── dispatch.py
+            ├── ledger.py
+            ├── orchestration_common.py
+            └── sql/
+                └── 001_initial.sql
 ```
 
 - [Detailed design (Chinese)](DESIGN.md)
 - [Skill workflow](.agents/skills/orchestrate-codex-tasks/SKILL.md)
 - [Controller/Worker protocol](.agents/skills/orchestrate-codex-tasks/references/protocol.md)
 - [Independent-task tool contract](.agents/skills/orchestrate-codex-tasks/references/tool-contracts.md)
+- [Dispatch manifest and renderer](.agents/skills/orchestrate-codex-tasks/references/dispatch.md)
+- [Durable local ledger](.agents/skills/orchestrate-codex-tasks/references/ledger.md)

@@ -1,6 +1,6 @@
 ---
 name: orchestrate-codex-tasks
-description: Coordinate the current Codex task as a Controller with multiple independent Codex Worker tasks/threads through task creation, cross-task messages, status-title updates, health checks, adaptive replanning, worktree isolation, and result synthesis. Run all visible coordination in English or Chinese to match the user's orchestration request. Use only when the user explicitly invokes this skill to execute work or clearly asks for separate, independent, or background Codex tasks, a Controller + Worker workflow, cross-task coordination, “主控 + Worker”, “独立任务并发”, or “跨任务并发”. Do not use for Codex subagents, generic requests to work faster, vague parallelism, shell/program concurrency, simple tightly coupled work, or requests that do not authorize creating new Codex tasks.
+description: Coordinate the current Codex task as a Controller with multiple independent Codex Worker tasks/threads through a durable local SQLite ledger, validated dispatch manifests, task creation, cross-task messages, status-title updates, health checks, adaptive replanning, worktree isolation, and result synthesis. Run all visible coordination in English or Chinese to match the user's orchestration request. Use only when the user explicitly invokes this skill to execute work or clearly asks for separate, independent, or background Codex tasks, a Controller + Worker workflow, cross-task coordination, “主控 + Worker”, “独立任务并发”, or “跨任务并发”. Do not use for Codex subagents, generic requests to work faster, vague parallelism, shell/program concurrency, simple tightly coupled work, or requests that do not authorize creating new Codex tasks.
 ---
 
 # Orchestrate Codex Tasks
@@ -26,15 +26,19 @@ description: Coordinate the current Codex task as a Controller with multiple ind
 - 不用调度流程绕过审批、沙箱、凭据、外部写入或其他权限边界。
 - 不自动提交、推送、开 PR、发布或删除，除非用户的原始请求明确包含相应动作。
 - 保留单一决策中心：Worker 负责执行和提供证据，主控负责范围、决策、冲突处理、验收和最终汇总。
+- 主控是本地 SQLite 账本的唯一写者。Worker 不读取、写入、复制或删除主控账本，只通过跨任务消息报告。
+- 只通过 `scripts/ledger.py` 写账本；不得直接执行 SQL 修改状态。`scripts/dispatch.py` 只验证和渲染，不能替代真实 Codex 工具调用。
 
 ## 读取运行协议
 
 在创建第一个 Worker 前：
 
 1. 完整读取 [references/tool-contracts.md](references/tool-contracts.md)，确认当前任务工具、worktree、远程主机和 Handoff 契约。
-2. 完整读取 [references/protocol.md](references/protocol.md)，使用其中的语言规则、消息格式、标题状态机和运行账本。
-3. `runLanguage=en` 时完整读取 [references/worker-prompt.en.md](references/worker-prompt.en.md)；`runLanguage=zh-CN` 时完整读取 [references/worker-prompt.zh-CN.md](references/worker-prompt.zh-CN.md)。只加载并派发匹配语言的模板。
-4. 如果当前运行时工具契约与 reference 不同，以当前可调用工具的 schema 为准，并用 `runLanguage` 向用户说明会影响行为的差异。
+2. 完整读取 [references/protocol.md](references/protocol.md)，使用其中的语言规则、消息格式和标题状态机。
+3. 完整读取 [references/ledger.md](references/ledger.md)，按其中顺序建立本地 SQLite 事实源、记录外部操作并恢复运行。
+4. 完整读取 [references/dispatch.md](references/dispatch.md)，使用规范化清单、DAG、写边界和渲染脚本。
+5. `runLanguage=en` 时完整读取 [references/worker-prompt.en.md](references/worker-prompt.en.md)；`runLanguage=zh-CN` 时完整读取 [references/worker-prompt.zh-CN.md](references/worker-prompt.zh-CN.md)。只加载并派发匹配语言的模板。
+6. 如果当前运行时工具契约与 reference 不同，以当前可调用工具的 schema 为准，并用 `runLanguage` 向用户说明会影响行为的差异。
 
 ## 1. 执行授权门
 
@@ -61,20 +65,21 @@ description: Coordinate the current Codex task as a Controller with multiple ind
    - 列出项目；
    - 写代码时还需具备 Handoff 及其状态查询能力，或在派发前确定用户认可的替代回收方案。
 2. 生成短且本次唯一的 `runId`，例如 `R7K2`。
-3. 立即使用 protocol reference 中匹配 `runLanguage` 的 `PLANNING` 模板给当前任务改名。
-
-4. 获取并验证当前主控的 `threadId`；跨主机时同时获取 `hostId`。优先使用运行时直接提供的地址，否则用唯一 `runId` 标题从任务列表解析。不能得到唯一匹配时，停止并向用户报告。
-5. 解析并发上限：
+3. 获取并验证当前主控的 `threadId`；跨主机时同时获取 `hostId`。优先使用运行时直接提供的地址；缺失时才按 ledger reference 的受限 bootstrap 设置唯一 `runId` 标题并从任务列表解析。不能得到唯一匹配时停止。
+4. 按 ledger reference 初始化稳定的本地 SQLite 账本，并读取 stdout 返回的 `databasePath`。Git 项目必须用本地 `.git/info/exclude` 排除运行目录。初始账本无法安全创建时不派发 Worker。
+5. 使用 dispatch script 渲染匹配 `runLanguage` 的 `PLANNING` 标题。除寻址 bootstrap 外，先写 `SET_TITLE` intent，再调用实际标题工具并写 outcome。
+6. 解析并发上限：
    - 默认 `maxActiveWorkers = 8`。
    - 接受用户明确给出的正整数覆盖值。
    - 并发值只是上限；不要为了填满槽位制造低价值 Worker。
-6. 把工作拆成轻量 DAG。每个 Worker 必须具备单一目标、明确输入、2–5 个可观察里程碑、独立验收条件、文件所有权和已知依赖。
-7. 派发前进行任务重量审查。跨越多个顶层子系统、包含多个可独立验收目标、同时承担实现/规格/TDD/完整回归，或存在大量未知前置时，优先继续拆分；确实不可拆时，记录原因、首个健康检查点和预计最慢合法命令。
-8. 把高度耦合实现、共享接口定稿、用户偏好、风险接受和最终整合留给主控。
-9. 使用项目列表选择执行位置：
+7. 把工作拆成轻量 DAG。每个 Worker 必须具备单一目标、明确输入、2–5 个可观察里程碑、独立验收条件、文件所有权和已知依赖。
+8. 派发前进行任务重量审查。跨越多个顶层子系统、包含多个可独立验收目标、同时承担实现/规格/TDD/完整回归，或存在大量未知前置时，优先继续拆分；确实不可拆时，记录原因、首个健康检查点和预计最慢合法命令。
+9. 把高度耦合实现、共享接口定稿、用户偏好、风险接受和最终整合留给主控。
+10. 使用项目列表选择执行位置：
    - 用户明确指定的主机优先于默认策略；
    - 否则优先本地同项目；
    - 仅在本地缺少必要项目、依赖或能力时选择明确匹配的远程项目。
+11. 写 draft manifest，使用 dispatch script 校验并编译，再用 ledger script 原子激活。清单校验、持久化和 task 规划完成前不创建 Worker。
 
 ## 3. 选择 Worker 环境
 
@@ -91,19 +96,20 @@ description: Coordinate the current Codex task as a Controller with multiple ind
 
 对依赖已满足的 Worker，最多派发到 `maxActiveWorkers`：
 
-1. 生成稳定 `workerId`，例如 `W1`。
-2. 使用 protocol reference 中的完整 Worker Prompt，直接注入：
+1. 从 ledger `status` 和当前编译 manifest 运行 dispatch `ready`；只处理 `readyWorkers`，不得仅凭上下文估算槽位或依赖。
+2. 为 Worker 使用清单中的稳定 `workerId`，例如 `W1`。
+3. 使用 dispatch `render-worker` 生成匹配语言的完整 Worker Prompt、`promptHash`、标题和 create request。Prompt 必须注入：
    - `runId`、`workerId`；
    - 主控 `threadId` 和需要时的 `hostId`；
    - 目标、范围、输入、禁止事项；
    - 主机、环境和 worktree 起始状态；
    - 文件写入边界、成果回收方式和验收命令。
    - 2–5 个可观察里程碑、首个健康检查点和已知长命令的预期墙钟时间。
-3. 创建独立任务；除非用户明确指定，否则不覆盖 Worker 的模型或 reasoning 配置。
-4. 记录返回的 `threadId` 或 `clientThreadId`、`hostId`、环境和状态。
-5. 获得真实 `threadId` 后，立即使用匹配 `runLanguage` 的 `RUNNING` Worker 标题模板改名。
-6. 首波派发完成后，使用匹配 `runLanguage` 的 `TRACKING` 模板更新主控标题。
-7. 立即用 `runLanguage` 向用户报告 Worker 名称、目标、当前活跃数、排队数、并发上限、worktree 起始状态和任何远程主机选择。
+4. 用渲染结果的最小化 request 写 `CREATE_THREAD` intent；之后调用实际创建工具，再用清理后的稳定 ID 写 outcome。除非用户明确指定，否则不覆盖 Worker 的模型或 reasoning 配置。
+5. 记录返回的 `threadId` 或 `clientThreadId`、`hostId`、环境和状态。工具超时或结果含糊时保留 pending/unknown，先核对外部事实，不重复创建。
+6. 获得真实 `threadId` 后，按相同 intent/tool/outcome 顺序设置渲染好的 `RUNNING` 标题。
+7. 首波派发完成后，以 ledger 中的实际活跃数渲染 `TRACKING` 主控标题，并按 intent/tool/outcome 更新。
+8. 立即用 `runLanguage` 向用户报告 Worker 名称、目标、当前活跃数、排队数、并发上限、worktree 起始状态和任何远程主机选择。
 
 worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在解析到真实 `threadId` 前，不对临时 ID 调用等待、改名或跨任务消息工具，也不重复创建相同 Worker。
 
@@ -123,6 +129,8 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 - 没有状态变化时，最长约每 60 秒发送一次有信息量的简短心跳。
 - 不把 Worker 的自称完成直接视为验收通过。
 - 不把消息频繁等同于有效进展。每次 `PROGRESS` 更新当前里程碑、已经关闭和剩余的验收项、预计剩余时间，以及正在运行的已声明长命令。
+- 每条可接受的 Worker 消息先以 `WORKER_MESSAGE_APPLIED` 落账，再执行标题、回复、Handoff 或下一波派发。旧 `seq` 只确认忽略，不重复状态变化。
+- 每次等待快照后保存 cursor。跨任务消息先由账本分配 `controllerSeq`，再用 dispatch script 渲染，按 intent/tool/outcome 发送。
 
 把 `PROVISIONING`、`RUNNING`、`BLOCKED` 和 `REVIEW` 都计入活跃数。`ACCEPTED` 或 `RETIRED` 才释放槽位。
 
@@ -140,9 +148,9 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 
 审查流程：
 
-1. 将 Worker 健康度记为 `AT_RISK`，主控使用 protocol reference 的 `REPLANNING` 标题；Worker 继续执行时保留 `✍️` 并加“效率审查”后缀，暂停等待重规划时使用 `⌛️`。
+1. 用 `WORKER_HEALTH_CHANGED` 将 Worker 健康度记为 `AT_RISK`，再使用 dispatch script 渲染 `REPLANNING` 主控标题；Worker 继续执行时保留 `✍️` 并加“效率审查”后缀，暂停等待重规划时使用 `⌛️`。
 2. 发送 `CHECKPOINT`，要求 Worker 在安全边界暂停新阶段并回报：已完成/剩余验收项、当前里程碑、文件与未提交成果、重复或冗余工作、可拆分单元、预计剩余时间和下一条不可中断命令。
-3. 主控在原始授权内选择并记录一种处理：
+3. 主控在原始授权内选择并记录一种处理；task 规格变化使用 `TASK_REPLANNED`，新 manifest 重新编译并激活：
    - 继续当前计划，但给出理由、下一个可验证里程碑和复查时间；
    - 发送 `REPLAN`，一次性授权已经核对的有界 manifest，采用首个 nonzero/timeout 即停，避免逐步微授权；
    - 删除被更强证据覆盖的重复执行，不能降低原验收标准；
@@ -157,12 +165,12 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 
 收到 `BLOCKED` 或发现等待用户/外部条件时：
 
-1. 立即使用匹配 `runLanguage` 的 `BLOCKED` Worker 标题模板改名。
+1. 先落账状态和阻塞证据，再使用 dispatch script 渲染匹配 `runLanguage` 的 `BLOCKED` 标题，按 intent/tool/outcome 改名。
 
 2. 判断是否能在原始授权内安全决定。
-3. 能决定时，记录决定并用 `DECISION` 消息回复；Worker 恢复后改回 `✍️`。
+3. 能决定时，记录决定；先写消息 intent 取得 `controllerSeq`，再渲染并发送 `DECISION`，Worker 恢复后改回 `✍️`。
 4. 需要用户决定时：
-   - 使用匹配 `runLanguage` 的 `WAITING_FOR_USER` 模板更新主控标题；
+   - 使用 dispatch script 渲染匹配 `runLanguage` 的 `WAITING_FOR_USER` 标题并按外部操作流程更新；
    - 立即用 `runLanguage` 报告事实、选项、建议和不决策的影响；
    - 暂停受影响路径，继续不相关且安全的工作。
 5. 不因阻塞自动扩大范围、权限或外部影响。
@@ -178,7 +186,7 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
    - 有价值成果已经回收，或者主控在原始授权内明确记录不再采用；
    - 不存在仍需恢复的唯一未提交成果；否则保持 `⌛️`；
    - 账本已记录 `terminalReason` 和 `archiveReady=true`。
-3. 使用匹配 `runLanguage` 的 `RETIRED` 标题模板，将任务改为 `🗑️` 并释放槽位。
+3. 先用账本状态事件通过终态门，再渲染匹配 `runLanguage` 的 `RETIRED` 标题，将任务改为 `🗑️` 并释放槽位。
 4. 立即向用户说明终止原因、替代 Worker、成果处置和残余风险。
 5. `🗑️` 表示逻辑终止且可人工归档，不代表自动归档、删除任务、删除分支或清理 worktree。
 
@@ -186,7 +194,7 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 
 收到 `DONE` 或观察到 Worker 结束后：
 
-1. 立即进入 `REVIEW`，使用匹配 `runLanguage` 的 `REVIEW` 标题模板改为 `🔍`；Worker 的 `DONE` 只是完成声明，不是验收结果。
+1. 立即在账本进入 `REVIEW`，再使用 dispatch script 渲染匹配 `runLanguage` 的 `REVIEW` 标题并按外部操作流程改为 `🔍`；Worker 的 `DONE` 只是完成声明，不是验收结果。
 2. 读取 Worker 的最终结果、文件清单、命令和验证证据。
 3. 对照 Worker Prompt 的验收条件独立核对。
 4. 验收不通过时恢复 `RUNNING` 和 `✍️`，发送 `REVISION`，并要求在原范围内修订；需要外部决定时进入 `BLOCKED`。
@@ -205,7 +213,7 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
    - 原范围本来就不要求合入时，已确认报告、审计、设计或候选包等交付物可访问；
    - 不存在仅滞留在临时 worktree 中、仍需回收的必要成果；
    - 账本已记录 `terminalReason` 和 `archiveReady=true`。
-9. 使用匹配 `runLanguage` 的 `ACCEPTED` 标题模板改为 `✅`，释放槽位并派发下一波，但保留该任务，不自动归档。
+9. 先用账本状态事件通过终态门，再渲染匹配 `runLanguage` 的 `ACCEPTED` 标题改为 `✅`，释放槽位并从 `ready` 结果派发下一波，但保留该任务，不自动归档。
 
 不要使用 `📋` 区分报告、审计、设计或“无合入物”任务。图标表达生命周期，而不是交付物类型；此类任务通过验收后同样使用 `✅`，可在标题后缀说明“无合入物”。
 
@@ -215,15 +223,17 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 
 全部 Worker 已验收并完成总体组合验证后：
 
-1. 使用匹配 `runLanguage` 的 `COMPLETE` 模板更新主控标题。
-2. 用 `runLanguage` 向用户汇报总体结果、Worker 状态、关键决定、代码回收、验证证据和残余风险。
-3. 保留所有 `✅`、`🗑️`、`⌛️` 和主控任务。
-4. 不调用任何归档工具。`✅` 和 `🗑️` 明确表示用户可以直接人工归档；用户明确要求由 Codex 归档时，把它视为本次自动编排之外的独立、精确目标操作。
+1. 完成当前 cycle 并记录 `RUN_COMPLETED`。
+2. 使用 dispatch script 渲染匹配 `runLanguage` 的 `COMPLETE` 标题，按 intent/tool/outcome 更新主控标题。
+3. 完成 ledger `verify`，确认没有 pending operation，再创建一致 SQLite backup。
+4. 用 `runLanguage` 向用户汇报总体结果、Worker 状态、关键决定、代码回收、验证证据和残余风险。
+5. 保留所有 `✅`、`🗑️`、`⌛️` 和主控任务。
+6. 不调用任何归档工具。`✅` 和 `🗑️` 明确表示用户可以直接人工归档；用户明确要求由 Codex 归档时，把它视为本次自动编排之外的独立、精确目标操作。
 
 ## 11. 运行中调整并发
 
-- 升高上限：更新账本，从已规划的就绪队列补充派发，不重复或重新拆分运行中的任务。
-- 降低上限：停止新派发，让现有 Worker 自然完成；除非用户明确要求停止具体 Worker，否则不自动中断。
+- 升高上限：更新账本和当前 manifest 的 `maxActiveWorkers`，重新编译并激活，从已规划的就绪队列补充派发，不重复或重新拆分运行中的任务。
+- 降低上限：更新账本和 manifest 后停止新派发，让现有 Worker 自然完成；除非用户明确要求停止具体 Worker，否则不自动中断。
 - 调到 8 以上：重建最多 8 目标的监控分组。
 - 无法满足用户值时：报告 `requested`、可执行 `effective` 和原因，不静默替换。
 - 每次调整都向用户报告旧值、新值、活跃数和排队数。
@@ -232,11 +242,12 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 
 主控上下文丢失或任务恢复时：
 
-1. 使用 `runId` 搜索任务标题。
-2. 用任务列表重建 Worker 集合。
-3. 从运行账本恢复 `runLanguage`；账本不可用时，从主控标题和最近一条实质性用户请求恢复。
-4. 用任务读取工具恢复近期状态和证据。
-5. 按 `runId + workerId + seq` 去重 Worker 消息；恢复每个 Worker 的 `lastControllerSeq`，主控新命令必须继续严格递增。
-6. 不因恢复失败创建重复 Worker。
+1. 从稳定运行目录找到 ledger；先执行 `verify`、`status` 和 `pending`，从账本恢复 `runId`、`runLanguage`、Controller、manifest、Worker、cursor、消息序号和 operation。
+2. 使用任务列表、即时等待快照和必要的紧凑读取收集外部观察事实，再用 ledger `audit` 比较；标题不能覆盖账本。
+3. 先核对所有 `INTENT/UNKNOWN` 外部操作，写入真实 outcome；没有证明失败前不重试创建、消息、改名或 Handoff。
+4. 需要时用 ledger `manifest` 导出当前编译清单，并用 dispatch `ready` 重新计算，不从压缩后的记忆重建队列。
+5. 只应用更大的 Worker `seq`；新主控命令继续账本分配的 `controllerSeq`。
+6. 账本损坏或丢失时按 ledger reference 的备份或保守重建流程执行；无法唯一核对时阻塞并向用户报告。
+7. 不因恢复失败创建重复 Worker，也不把内存状态冒充持久账本。
 
-始终把账本作为逻辑状态、标题作为用户可见投影。标题更新失败时有限重试并报告，但不要丢弃 Worker 成果或违反禁止归档规则。
+始终把 SQLite 账本作为逻辑状态、标题作为用户可见投影。账本写入失败时停止新的外部副作用并进入 `DEGRADED` 恢复；标题更新失败时有限重试并报告，但不要丢弃 Worker 成果或违反禁止归档规则。

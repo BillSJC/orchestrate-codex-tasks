@@ -33,6 +33,8 @@
 | 转移任务与代码 | 客户端 Git/worktree 流程 | `handoff_thread` |
 | 查询转移 | 客户端操作状态 | `get_handoff_status` |
 
+官方 App Server 文档确认 `thread/start` 创建 thread、`thread/name/set` 修改用户可见名称、`turn/start` 向已有 thread 增加一轮，`thread/list/read` 用于发现和读取。当前 Codex App 高层工具把这些产品原语包装成面向本次运行的调用；高层字段不是 App Server JSON-RPC 的逐字段复制。
+
 ## 2. 工具发现与预检
 
 需要时使用工具搜索发现：
@@ -65,9 +67,24 @@
 
 零个或多个匹配都视为无法可靠寻址。此时不要创建 Worker，因为 Worker 无法保证把阻塞和完成状态发送回正确主控。
 
+### 2.2 脚本、账本与真实工具
+
+本 Skill 自带两个 CLI：
+
+- `scripts/dispatch.py`：校验/编译 manifest，选择 ready Worker，渲染 Prompt、标题和结构化消息。
+- `scripts/ledger.py`：唯一 SQLite writer，记录 task、Worker、cursor、决定、健康和外部 operation。
+
+脚本不会调用本节列出的 Codex 任务工具。每次外部写操作严格执行：
+
+```text
+ledger intent -> actual high-level tool -> sanitized ledger outcome
+```
+
+真实工具调用成功才算外部成功；renderer stdout、intent 成功或工具返回 `operationId` 都不能单独证明最终成功。完整顺序见 [ledger.md](ledger.md) 和 [dispatch.md](dispatch.md)。
+
 ## 3. 创建独立任务
 
-先列出项目，再使用返回的真实 `projectId`。
+先列出项目，再使用返回的真实 `projectId`。创建前必须已有编译并激活的 manifest、`TASK_PLANNED` 和 `CREATE_THREAD` intent。
 
 ### 3.1 本地只读项目 Worker
 
@@ -115,6 +132,8 @@ create_thread({
 
 直接创建通常返回 `threadId` 和 `hostId`。排队创建 worktree 时可能先返回 `clientThreadId`；它不是可等待或可改名的真实任务 ID。
 
+创建调用后，只把 `threadId/clientThreadId/hostId` 和简短摘要写入 outcome，不把完整 Prompt 或原始工具输出落入账本。结果含糊时记录 `UNKNOWN`，先用任务列表核对，不能直接重复创建。
+
 ## 4. 标题和跨任务消息
 
 当前主控改名时省略 `threadId`：
@@ -156,6 +175,8 @@ send_message_to_thread({
 
 同一主机且 schema 不要求 `hostId` 时可以省略。不能用空字符串代替缺失 ID。
 
+标题和消息也必须先写 intent。`SEND_MESSAGE` 的 `controllerSeq` 只能使用 ledger intent 原子分配的值，再由 dispatch renderer 生成 Prompt；不得从上下文自行递增。工具调用完成后写 sanitized outcome。
+
 ## 5. 监控与读取
 
 等待最多 8 个真实任务：
@@ -189,6 +210,8 @@ read_thread({
 ```
 
 只有核对命令输出确实必要时才设置 `includeOutputs: true`，并保持输出上限紧凑。
+
+每次有效快照先用 `CURSOR_UPDATED` 落账，再开始下一轮等待。收到 Worker 协议消息时先写 `WORKER_MESSAGE_APPLIED`，再进行标题、回复或 Handoff。
 
 ### 5.1 超过 8 个活跃 Worker
 
@@ -271,6 +294,8 @@ get_handoff_status({
 - 冲突时保留 worktree，停止后续回收，报告冲突，不做 reset、checkout 覆盖或其他破坏性清理。
 - 主控不能 Handoff 自己；只操作 Worker。
 
+调用 `handoff_thread` 前写 `HANDOFF` intent。初始工具返回只表示操作已启动，写 outcome 后仍保持 `HANDOFF_RUNNING`；只有 `get_handoff_status` 返回成功终态并完成必要 Local 组合验证，才用 `INTEGRATION_UPDATED` 推进到 `HANDED_OFF/VALIDATING/ACCEPTED`。
+
 Codex 托管 worktree 可能受产品级保留和清理策略影响。“不自动归档”只约束本 Skill 的归档行为，不保证底层 worktree 永久存在。标记 `✅` 或 `🗑️` 前，确保需要保留的代码已 Handoff、已用用户认可方式持久化，或已明确记录不再采用；不能让仍需恢复的唯一成果滞留在临时 worktree。
 
 效率重规划不能绕过成果回收：写入型 Worker 持有未提交唯一成果时，不得直接创建第二个写入 Worker 接管同一文件边界。先让原 Worker 到达安全 checkpoint，并使用原请求已授权的 Handoff、commit 或替代持久化方式形成稳定基线；只读分析和互不重叠的工作仍可独立拆分。
@@ -341,7 +366,7 @@ handoff_thread({
 
 - Codex App Server 生命周期：<https://learn.chatgpt.com/docs/app-server#lifecycle-overview>
 - Codex App Server API：<https://learn.chatgpt.com/docs/app-server#api-overview>
-- Codex Skills：<https://learn.chatgpt.com/docs/build-skills>
-- Codex Worktrees 与 Handoff：<https://learn.chatgpt.com/docs/environments/git-worktrees>
+- Codex Skills：<https://learn.chatgpt.com/docs/customization/overview#skills>
+- Codex Worktrees 与 Handoff：<https://learn.chatgpt.com/docs/environments/git-worktrees#terminology>
 
-官方文档描述底层产品行为；本文件中的高层工具字段来自当前 Codex 运行时 schema。二者冲突时，说明差异并优先遵守实际可调用 schema。
+官方文档描述底层产品行为以及 Skill 可以包含 scripts/references；本文件中的 `create_thread`、`set_thread_title`、`send_message_to_thread`、`wait_threads`、`handoff_thread` 和 `get_handoff_status` 字段来自当前 Codex App 运行时 schema。二者冲突时，说明差异并优先遵守实际可调用 schema。

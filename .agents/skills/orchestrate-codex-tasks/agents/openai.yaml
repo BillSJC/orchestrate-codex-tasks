@@ -1,7 +1,7 @@
 interface:
   display_name: "Codex Task Orchestrator"
-  short_description: "Coordinate independent Codex Controller and Worker tasks"
-  default_prompt: "Use $orchestrate-codex-tasks to split this request into independent Codex Worker tasks, coordinate them, and synthesize the verified result in the language of the user's orchestration request."
+  short_description: "Coordinate Codex Workers with a durable local ledger"
+  default_prompt: "Use $orchestrate-codex-tasks to plan independent Codex Worker tasks, persist the run locally, coordinate and recover their work, and synthesize the verified result."
 
 policy:
   allow_implicit_invocation: true

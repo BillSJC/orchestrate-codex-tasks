@@ -1,5 +1,7 @@
 # Controller 与 Worker 协作协议
 
+协议版本：`2`
+
 ## 目录
 
 1. 运行身份
@@ -18,13 +20,14 @@
 
 每次运行生成：
 
+- `protocolVersion`：固定为 `2`。
 - `runId`：短运行标识，例如 `R7K2`。
 - `runLanguage`：`en` 或 `zh-CN`。
 - `workerId`：稳定 Worker 标识，例如 `W1`。
 - `controllerThreadId`：主控真实任务 ID。
 - `controllerHostId`：跨主机时必填；同主机且工具不要求时可省略。
 
-主控必须把自己的真实 `threadId` 和 `runLanguage` 直接写入每个 Worker Prompt。Worker 不猜测、不搜索主控地址，也不自行选择初始协调语言。
+主控必须把 `protocolVersion`、自己的真实 `threadId` 和 `runLanguage` 直接写入每个 Worker Prompt。Worker 不猜测、不搜索主控地址，也不自行选择初始协调语言。协议版本不匹配时，Worker 立即用 `BLOCKED` 报告并停止需要协调的动作。
 
 ## 2. 运行语言
 
@@ -65,7 +68,7 @@
 1. 完整读取匹配语言的模板。
 2. 填充所有占位符，并让任务目标、范围、边界和验收说明使用 `runLanguage`；路径、命令、代码和交付物要求保持原样。
 3. 不临时翻译另一份模板，也不把两种模板混合进同一个 Worker Prompt。
-4. 将填充后的模板正文作为 `create_thread` 初始 `prompt`。
+4. 优先使用 [dispatch.md](dispatch.md) 中的 renderer 填充模板，并将完成后的模板正文作为 `create_thread` 初始 `prompt`。
 5. 同一主机且 `hostId` 可省略时，删除整个 `controllerHostId` 行和消息调用中的整个 `hostId` 字段，不传空字符串。
 
 ## 4. Worker 到主控的消息
@@ -307,6 +310,16 @@ Worker 自称 `DONE` 只触发 `REVIEW` 和 `🔍`。只有主控验收并通过
 
 ## 7. 运行账本
 
+账本必须是 [ledger.md](ledger.md) 定义的本地 SQLite 数据库，而不是仅存在于主控上下文中的 Markdown 表格或内存对象。
+
+- 默认路径为 `<PROJECT_ROOT>/.codex/runtime/orchestrate-codex-tasks/runs/<runId>/ledger.sqlite3`。
+- 只有 Controller 通过 `scripts/ledger.py` 写入；Worker 不访问账本。
+- 编译 manifest、任务规范、地址、生命周期、健康、序号、cursor、决定、整合、cycle 和外部 operation 都必须持久化。
+- `create_thread`、跨任务消息、标题和 Handoff 使用 `intent -> tool call -> outcome`，恢复时先核对 pending operation，不能盲目重试。
+- 所有事件使用稳定 idempotency key，事件表 append-only。
+- 每次上下文恢复先执行 `verify + status + pending + audit`，再继续观察、发消息或创建任务。
+- `✅/🗑️` 仍只代表 `archiveReady=true`；账本和脚本都不自动归档。
+
 每个 Worker 保存：
 
 | 字段 | 含义 |
@@ -331,6 +344,7 @@ Worker 自称 `DONE` 只触发 `REVIEW` 和 `🔍`。只有主控验收并通过
 | `currentMilestone` | 当前可观察里程碑 |
 | `closedAcceptanceItems` | 已关闭的验收项 |
 | `remainingAcceptanceItems` | 剩余验收项 |
+| `lastDetails/nextActions/needs/evidence` | 最近一条 Worker 协议消息的事实、下一步、待决事项和证据 |
 | `lastUsefulProgressAt` | 最近一次关闭验收项或产生可复核成果的时间 |
 | `estimatedRemaining` | Worker 当前估计及理由 |
 | `decisionRoundTrips` | 可预见的主控逐步放行往返数 |
@@ -340,6 +354,7 @@ Worker 自称 `DONE` 只触发 `REVIEW` 和 `🔍`。只有主控验收并通过
 | `archiveReady` | 仅 `ACCEPTED/RETIRED` 且归档就绪门通过时为 `true` |
 | `terminalReason` | 完成摘要或废弃原因 |
 | `replacementWorkerId` | 被取代时填写，否则 `none` |
+| `promptVersion/promptHash` | Worker Prompt 协议与内容指纹 |
 
 运行级保存：
 
@@ -355,6 +370,11 @@ Worker 自称 `DONE` 只触发 `REVIEW` 和 `🔍`。只有主控验收并通过
 | `monitorGroups` | 每组最多 8 个 Worker |
 | `localPreferred` | 默认 `true` |
 | `oneToOneSince` | 只有一个活跃 Worker 且无队列时的起始时间；否则为空 |
+| `currentManifestHash` | 当前规范化调度清单 |
+| `controllerEpoch` | 单写者接管代次 |
+| `revision` | append-only 事件修订号 |
+
+账本 schema、命令、备份、恢复、隐私和降级规则以 [ledger.md](ledger.md) 为准；清单结构和渲染规则以 [dispatch.md](dispatch.md) 为准。
 
 ## 8. 效率检查与重规划
 
@@ -388,8 +408,8 @@ effective = min(requested, 值得独立派发且已就绪的任务数, 当前环
 
 不要把 8 当成必须创建的 Worker 数量。
 
-- 升高时从既有队列补充。
-- 降低时不自动停止现有 Worker，只暂停新派发。
+- 升高时同时更新 ledger 和当前 manifest 的上限、重新编译激活，再从既有队列补充。
+- 降低时同时更新 ledger 和 manifest，不自动停止现有 Worker，只暂停新派发。
 - 大于 8 时重建监控分组。
 - 非正整数、含糊范围或环境不支持时请求修正或报告可执行值。
 - 每次改变都使用 `runLanguage` 报告旧值、新值、活跃数和排队数。
@@ -400,23 +420,25 @@ effective = min(requested, 值得独立派发且已就绪的任务数, 当前环
 
 只有用户明确要求切换会话或协调语言时：
 
-1. 更新运行账本中的 `runLanguage`。
-2. 立即用新语言回复用户，并更新主控标题。
-3. 向所有活跃 Worker 发送 `LANGUAGE_UPDATE`，其中 `language` 为新值。
-4. Worker 从下一条消息开始使用新语言，不重写历史消息。
-5. 新创建的 Worker 使用新语言对应的完整 Worker Prompt。
+1. 记录用户语言决定，更新运行账本中的 `runLanguage`。
+2. 对尚未创建的 task 用 `TASK_REPLANNED` 只翻译人类可读规范，不改变范围或验收含义；重新编译并激活新语言 manifest。
+3. 立即用新语言回复用户，并更新主控标题。
+4. 向所有活跃 Worker 发送 `LANGUAGE_UPDATE`，其中 `language` 为新值。
+5. Worker 从下一条消息开始使用新语言，不重写历史消息。
+6. 新创建的 Worker 使用新语言对应的完整 Worker Prompt。
 
 ## 11. 恢复与去重
 
-1. 用 `runId` 搜索标题。
-2. 列出任务并匹配 `runId-workerId`。
-3. 从运行账本恢复 `runLanguage`；账本缺失时，从主控标题和最近一条实质性用户请求恢复。
-4. 读取近期任务状态。
+1. 从稳定运行目录打开账本，执行 `verify`、`status` 和 `pending`。
+2. 从账本恢复 `runId`、`runLanguage`、Controller、当前 manifest、Worker 地址、cursor 和序号。
+3. 列出任务并匹配 `runId-workerId`，用即时等待快照和必要的紧凑读取形成 observed facts，再执行只读 `audit`。
+4. 先核对 pending `INTENT/UNKNOWN`；没有外部证据前不重试创建、消息、标题或 Handoff。
 5. 只接受比 `lastSeq` 更新的 Worker 消息。
-6. 恢复每个 Worker 的 `lastControllerSeq`；新命令从更大序号继续，绝不复用旧序号。
+6. 新命令只使用 ledger 分配的更大 `controllerSeq`，绝不复用旧序号。
 7. Worker 忽略重复或更旧的 `controllerSeq`，主控也不因确认消息再次执行相同决定。
 8. `ACCEPTED/RETIRED` 后的旧 `PROGRESS` 或 `DONE` 不回退状态。
 9. `REVISION` 保持相同 Worker ID，消息序号继续增加。
 10. 恢复健康字段；缺失时从最近的可复核成果、timeout 和范围变化保守重建，不把消息频繁推断为 `HEALTHY`。
-11. 不因上下文丢失重复创建 Worker。
-12. 不因恢复、失败、完成或停止而自动归档任何任务；只恢复已有 `archiveReady` 值，不推断或自动执行归档。
+11. 账本缺失或损坏时按 ledger reference 从备份恢复或保守重建；无法唯一核对就阻塞。
+12. 不因上下文丢失重复创建 Worker，不把内存状态冒充持久账本。
+13. 不因恢复、失败、完成或停止而自动归档任何任务；只恢复已有 `archiveReady` 值，不推断或自动执行归档。

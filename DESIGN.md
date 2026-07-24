@@ -12,6 +12,8 @@
 - Worker 的第一条派发提示词必须直接包含主控的 `threadId`；跨主机时还必须包含 `hostId`。
 - 主控通过任务标题前缀表达实时状态，并向用户持续汇报进度和阻塞。
 - 主控采用“消息推送 + 主动轮询”双通道监控，不能只依赖 Worker 主动回报。
+- 主控把 manifest、Worker、消息序号、cursor、决定、整合和外部 operation 持久化到项目本地 SQLite 账本，避免上下文压缩后丢失调度事实。
+- Skill 自带确定性 dispatch/ledger CLI 和 SQL schema；脚本负责校验、渲染和持久化，实际 Codex 任务工具仍由主控调用。
 
 本文统一使用 **Worker Prompt（派发提示词）** 这一术语。
 
@@ -45,6 +47,9 @@
 9. 默认最多同时保留 8 个未完成 Worker；用户可以在每次运行开始前或运行期间明确调整该值。
 10. 支持本地和远程 `hostId`，但没有用户或环境上的特殊要求时优先选择本地主机。
 11. 主控必须区分“任务存活”和“有效进展”，在 Worker 过重、重复、范围膨胀或陷入长尾时主动请求 checkpoint，并在原授权内重规划。
+12. 主控必须在首次派发前建立稳定、私有且被 Git 忽略的 SQLite 运行账本；上下文压缩、进程重启或任务恢复时先从账本恢复并核对外部事实。
+13. 任务创建、跨任务消息、改名和 Handoff 必须使用幂等 `intent -> actual tool -> outcome`，含糊结果不能直接重试。
+14. 调度清单必须经过协议版本、DAG、里程碑、worktree 默认值、并发槽位和写边界校验后才能激活与派发。
 
 ### 2.2 不做什么
 
@@ -57,6 +62,9 @@
 - 不自动归档任何主控或 Worker 任务。
 - 不因时间阈值自动停止 Worker；时间只触发效率审查。
 - 不把 commentary 数量、频繁轮询或逐步微授权当成吞吐量。
+- 不让脚本直接调用 Codex 任务工具、拼装 App Server JSON-RPC 或绕过当前运行时高层工具。
+- 不把内存表格、标题或压缩后的上下文冒充持久账本。
+- 不把账本、备份、manifest、凭据或原始敏感工具输出提交或上传。
 
 ### 2.3 I18N 与运行语言
 
@@ -87,7 +95,7 @@ OpenAI 官方 Codex App Server 文档定义了线程和轮次的底层生命周�
 - [Codex App Server：生命周期](https://learn.chatgpt.com/docs/app-server#lifecycle-overview)
 - [Codex App Server：API 概览](https://learn.chatgpt.com/docs/app-server#api-overview)
 - [Codex App Server：启动或恢复线程](https://learn.chatgpt.com/docs/app-server#start-or-resume-a-thread)
-- [Codex Skills](https://developers.openai.com/codex/build-skills)
+- [Codex Skills](https://learn.chatgpt.com/docs/customization/overview#skills)
 
 在当前 Codex 桌面运行时中，主控不应直接拼装 App Server JSON-RPC，而应调用应用提供的高层工具：
 
@@ -319,9 +327,11 @@ handoff_thread({
 ```mermaid
 flowchart TD
     O["主人 / Owner"] <--> C["👑 主控任务 / Controller"]
-    C -->|"create_thread + Worker Prompt"| W1["✍️ Worker W1"]
-    C -->|"create_thread + Worker Prompt"| W2["✍️ Worker W2"]
-    C -->|"create_thread + Worker Prompt"| WN["✍️ Worker Wn"]
+    C <--> L["本地 SQLite 账本<br/>manifest / state / seq / cursor / operation"]
+    C --> D["dispatch.py<br/>校验 DAG、边界并渲染请求"]
+    D -->|"create_thread request"| W1["✍️ Worker W1"]
+    D -->|"create_thread request"| W2["✍️ Worker W2"]
+    D -->|"create_thread request"| WN["✍️ Worker Wn"]
     C -->|"send_message_to_thread"| W1
     C -->|"send_message_to_thread"| W2
     C -->|"send_message_to_thread"| WN
@@ -332,6 +342,7 @@ flowchart TD
     C -.->|"wait_threads + read_thread"| W2
     C -.->|"wait_threads + read_thread"| WN
     C -->|"CHECKPOINT / REPLAN"| W1
+    C -->|"intent → actual tool → outcome"| L
 ```
 
 核心原则是 **单一决策中心、多个执行单元、双向通信、主控验收**。
@@ -353,7 +364,7 @@ OpenAI 官方 Skill 文档说明，Skill 可以通过两种方式激活：
 1. 用户显式提及 `$skill-name`。
 2. 用户请求与 Skill 的 `description` 匹配时，由 Codex 隐式选择。
 
-参考：[Codex Skills：显式与隐式调用](https://developers.openai.com/codex/build-skills#how-codex-uses-skills)。
+参考：[Codex Skills：显式与隐式调用](https://learn.chatgpt.com/docs/build-skills#how-codex-uses-skills)。
 
 本 Skill 推荐允许隐式选择，但必须把“加载 Skill”和“获准创建独立任务”分开判断：
 
@@ -417,7 +428,7 @@ Skill 的 frontmatter `description` 应同时写清正向触发词和排除条�
 ```yaml
 ---
 name: orchestrate-codex-tasks
-description: Coordinate the current Codex task as a Controller with multiple independent Codex Worker tasks/threads through task creation, cross-task messages, status-title updates, health checks, adaptive replanning, worktree isolation, and result synthesis. Run all visible coordination in English or Chinese to match the user's orchestration request. Use only when the user explicitly invokes this skill to execute work or clearly asks for separate, independent, or background Codex tasks, a Controller + Worker workflow, cross-task coordination, “主控 + Worker”, “独立任务并发”, or “跨任务并发”. Do not use for Codex subagents, generic requests to work faster, vague parallelism, shell/program concurrency, simple tightly coupled work, or requests that do not authorize creating new Codex tasks.
+description: Coordinate the current Codex task as a Controller with multiple independent Codex Worker tasks/threads through a durable local SQLite ledger, validated dispatch manifests, task creation, cross-task messages, status-title updates, health checks, adaptive replanning, worktree isolation, and result synthesis. Run all visible coordination in English or Chinese to match the user's orchestration request. Use only when the user explicitly invokes this skill to execute work or clearly asks for separate, independent, or background Codex tasks, a Controller + Worker workflow, cross-task coordination, “主控 + Worker”, “独立任务并发”, or “跨任务并发”. Do not use for Codex subagents, generic requests to work faster, vague parallelism, shell/program concurrency, simple tightly coupled work, or requests that do not authorize creating new Codex tasks.
 ---
 ```
 
@@ -933,65 +944,156 @@ acceptanceDelta:
 5. 本 Skill 的自动编排流程不得调用 `set_thread_archived` 或其他归档能力。
 6. 归档与分支、worktree、文件删除是不同操作；终态图标不授权自动清理。
 
-## 11. 主控运行账本
+## 11. 本地持久化账本与确定性调度
 
-主控在上下文中维护一个紧凑账本：
+### 11.1 为什么不能只把账本放在上下文
 
-| 字段 | 含义 |
+主控运行时间可能远长于单次上下文窗口。只在上下文中维护 Markdown 表格会出现：
+
+- 上下文压缩后遗失未派发 task、依赖或写边界；
+- 忘记 `clientThreadId/threadId/hostId` 的映射并重复创建；
+- 丢失 `lastSeq/controllerSeq/cursor` 后重复执行消息或决定；
+- 工具调用超时后无法判断是“未发生”还是“已发生但结果未记录”；
+- 只凭标题推断状态，导致 `DONE` 被误当作 `ACCEPTED`；
+- 主控接管或进程重启后无法证明归档就绪门、Handoff 或组合验证已经完成。
+
+因此 SQLite 是运行逻辑事实源，标题只是用户可见投影，任务列表和读取结果是需要核对的外部事实。
+
+### 11.2 存储位置和隔离
+
+项目默认路径：
+
+```text
+<PROJECT_ROOT>/.codex/runtime/orchestrate-codex-tasks/runs/<runId>/ledger.sqlite3
+```
+
+约束：
+
+- 使用稳定项目目录，不把唯一账本放进 `/tmp` 或 Worker worktree。
+- Git 项目把 `/.codex/runtime/orchestrate-codex-tasks/` 写入本地 `.git/info/exclude`，不修改受版本控制的 `.gitignore`。
+- 目录和文件尽力使用 `0700/0600`。
+- 账本、备份、编译 manifest 和导出快照不提交、不推送、不上传。
+- 初始账本无法安全创建时不派发 Worker。
+
+### 11.3 单写者
+
+只有当前 `controllerThreadId + controllerEpoch` 对应的 Controller 可以写账本：
+
+- `scripts/ledger.py` 是唯一 writer。
+- Worker 不读取、写入、复制、移动或删除账本。
+- 不用 `sqlite3`、临时 Python 或手写 SQL 直接改状态。
+- Controller 接管必须有用户明确授权，并增加 `controllerEpoch`；旧 Controller 写入返回 `OWNER_CONFLICT`。
+
+### 11.4 schema
+
+协议版本为 `2`，第一版 schema version 为 `1`：
+
+| 表 | 责任 |
 |---|---|
-| `runId` | 本次调度标识 |
-| `workerId` | Worker 稳定标识 |
-| `threadId` | Worker 任务 ID |
-| `clientThreadId` | worktree 尚在创建时的临时 ID |
-| `hostId` | Worker 所在主机 |
-| `title` | 期望标题 |
-| `state` | `PROVISIONING/RUNNING/REVIEW/BLOCKED/ACCEPTED/RETIRED` |
-| `objective` | 子任务目标 |
-| `dependencies` | 前置 Worker |
-| `environment` | `local/worktree/projectless` |
-| `startingState` | worktree 起始状态；不适用时为空 |
-| `writeBoundary` | 文件所有权 |
-| `integrationPlan` | Handoff 或用户明确授权的替代回收方式 |
-| `lastSeq` | 已处理的最新 Worker 消息序号 |
-| `lastControllerSeq` | Worker 已应用的最新主控命令序号 |
-| `cursor` | `wait_threads` 增量游标 |
-| `result` | 验收后的结果摘要 |
-| `health` | `HEALTHY/AT_RISK/STALLED`，与生命周期正交 |
-| `currentMilestone` | 当前可观察里程碑 |
-| `closedAcceptanceItems` | 已关闭的验收项 |
-| `remainingAcceptanceItems` | 剩余验收项 |
-| `lastUsefulProgressAt` | 最近可复核成果或验收关闭时间 |
-| `estimatedRemaining` | Worker 当前 ETA 及理由 |
-| `decisionRoundTrips` | 可预见的逐步放行往返数 |
-| `scopeDeltaCount` | 新增验收族、子系统或写入边界次数 |
-| `timeoutCount` | timeout 次数 |
-| `nextHealthReviewAt` | 下一次效率复查点 |
-| `archiveReady` | 仅归档就绪门通过后的 `ACCEPTED/RETIRED` 为 `true` |
-| `terminalReason` | 成功完成摘要或废弃原因 |
-| `replacementWorkerId` | 被取代时填写，否则为 `none` |
+| `run_state` | 运行、Controller owner、语言、并发、派生计数、cycle、manifest 和 revision |
+| `manifests` | 规范化完整调度清单 |
+| `planned_tasks` | task spec、依赖、环境、写边界和队列状态 |
+| `workers` | 地址、生命周期、健康、消息序号、cursor、验收和终态 |
+| `operations` | 外部副作用 intent/outcome、request 幂等和主控消息序号 |
+| `integrations` | Handoff 与 Local 组合验证 |
+| `decisions` | 用户或 Controller 决定 |
+| `cycles` | 连续迭代 cycle |
+| `events` | append-only 审计事件 |
 
-运行级账本还必须保存：
+`events` 由 trigger 禁止 UPDATE/DELETE；额外 trigger 禁止 Worker/task 终态和 `COMPLETE` run 回退。每个事件有唯一 `idempotencyKey`、payload hash 和单调 revision。`verify` 还核对 foreign key、revision 连续性、event/manifest/task/operation 哈希、地址、健康度、序号和派生计数。
 
-| 字段 | 含义 |
-|---|---|
-| `runLanguage` | 本次运行的协调语言，`en` 或 `zh-CN` |
-| `controllerThreadId` | 主控任务 ID |
-| `controllerHostId` | 主控所在主机；同主机且工具不要求时可省略 |
-| `maxActiveWorkers` | 当前有效并发上限，默认 8 |
-| `activeCount` | 所有非 `ACCEPTED/RETIRED` Worker 数 |
-| `queuedCount` | 尚未创建且依赖未满足或等待槽位的 Worker 数 |
-| `monitorGroups` | 每组最多 8 个 Worker 的稳定监控分组 |
-| `localPreferred` | 固定为 `true`，除非用户明确指定远程优先 |
-| `oneToOneSince` | 只有一个活跃 Worker 且无队列时的起始时间；否则为空 |
+Worker 表持续保存：
 
-如果主控因压缩或恢复而丢失局部状态，可通过：
+- `threadId/clientThreadId/hostId`；
+- `PROVISIONING/RUNNING/REVIEW/BLOCKED/ACCEPTED/RETIRED`；
+- `HEALTHY/AT_RISK/STALLED`；
+- 当前里程碑、累计已关闭和剩余验收；
+- 最近一条消息的 `details/next/needs/evidence`，用于上下文恢复；
+- `lastSeq/lastControllerSeq/lastControllerSeqReserved/cursor`；
+- 最近有效进展、ETA、决策往返、范围变化、timeout 和下次复查；
+- `promptVersion/promptHash`；
+- `archiveReady/terminalReason/replacementWorkerId`。
 
-1. `runId` 搜索任务标题。
-2. `list_threads` 重建 Worker 列表。
-3. `read_thread` 重建最近状态。
-4. 根据消息中的 `seq` 去重，并从 `lastControllerSeq` 继续严格递增的主控命令。
+运行表保存：
 
-任务标题中的 `runId-workerId` 是恢复机制的一部分，不只是装饰。
+- `runId/runLanguage/controllerThreadId/controllerHostId/controllerEpoch`；
+- `maxActiveWorkers/activeCount/queuedCount/monitorGroups`；
+- `oneToOneSince/currentCycle/currentManifestHash`；
+- `persistenceMode/reconstructed/revision`。
+
+### 11.5 manifest 编译和激活
+
+原始 manifest 必须通过 `dispatch.py`：
+
+1. 校验 `protocolVersion=2`、ID、语言和最大并发；
+2. 校验 Worker DAG 无环且依赖存在；
+3. 强制 2–5 个可观察里程碑和非空验收；
+4. 写入型 Worker 默认 worktree，共享 Local 写入必须有显式授权字段；
+5. 检测可能同时活跃的 Worker 写边界冲突；
+6. 生成稳定拓扑顺序和 `manifestHash`。
+
+编译 manifest 再由 `ledger.py activate-manifest` 在 `ACTIVE` run 中原子保存并为新 task 写 `TASK_PLANNED`。已存在 task 的 spec 不被静默覆盖，也不能从新 manifest 静默遗漏非终态 task；重规划先写带 `previousSpecHash` 的 `TASK_REPLANNED`，删除前先显式取消未创建 task 或把已有 Worker 安全推进到终态。环境、project、写入方式、写边界及主要列表长度的结构变化会被机械识别，范围变化还必须引用已记录的用户决定；文本语义仍由 Controller 审查。
+
+### 11.6 外部操作的两阶段日志
+
+以下操作必须执行：
+
+```text
+intent -> actual high-level Codex tool -> sanitized outcome
+```
+
+- `CREATE_THREAD`
+- `SEND_MESSAGE`
+- `SET_TITLE`
+- `HANDOFF`
+
+intent 在工具调用前落盘：
+
+- `CREATE_THREAD` 将 task 置为 `DISPATCHING`，预留 `PROVISIONING` Worker 和并发槽位；
+- `SEND_MESSAGE` 原子分配新的 `controllerSeq`；
+- 同一个 `requestId` 重放不会重复 reservation；
+- 账本再次检查依赖、并发上限和活跃写边界。
+
+event payload、operation request 和 outcome 都采用按类型定义的封闭字段集合，只保存稳定 ID、最小语义和必要摘要；未知字段被拒绝，不会进入 append-only 轨迹。完整 Prompt、凭据或原始工具日志不落账。create 成功必须有真实或排队任务 ID，Handoff 启动成功必须有 `operationId`。调用超时或中断时保留 `INTENT/UNKNOWN`；恢复后先用任务事实核对，再写真实 outcome，不能盲目重试。
+
+Handoff 初次返回 `operationId` 只代表启动；仍需 `get_handoff_status` 确认终态，再更新 integration 和组合验证。
+
+### 11.7 调度脚本边界
+
+`dispatch.py` 可以：
+
+- `validate-manifest/compile-manifest/plan-events`；
+- 根据 ledger status 执行 `ready`；
+- 渲染本地化 Worker Prompt 和 `create_thread` 参数；
+- 渲染带账本序号的主控消息；
+- 渲染本地化生命周期标题。
+
+它不能调用 Codex 任务工具或写 SQLite。脚本 stdout 是候选请求，不是外部成功证据。
+
+### 11.8 敏感数据
+
+账本拒绝明显敏感字段、私钥块、常见 API key 形态、超大 JSON 和超长字符串，但该检测只是最后防线。
+
+不得保存：
+
+- token、cookie、Authorization header、密码、私钥或凭据；
+- 完整 Worker Prompt、原始模型推理或未经最小化的工具日志；
+- 个人直接联系方式、支付信息或与调度无关的用户数据。
+
+### 11.9 恢复顺序
+
+主控恢复时固定执行：
+
+1. 从稳定目录打开账本并执行 `verify`。
+2. 读取 `status` 和 `pending`。
+3. 用 `list_threads`、`wait_threads timeoutMs:0` 和必要的紧凑 `read_thread` 收集 observed facts。
+4. 使用只读 `audit` 比较账本和外部事实。
+5. 先核对 pending operation，未证明失败前不重试。
+6. 需要时导出当前 manifest，重新运行 `ready`。
+7. 只处理更大的 Worker `seq`，新命令继续 ledger 分配的 `controllerSeq`。
+8. ledger 损坏时从已验证 backup 恢复到新文件；ledger 丢失时保守重建并标记 `reconstructed`。
+
+无法唯一核对时进入 `BLOCKED`，不创建重复 Worker。任务标题中的 `runId-workerId` 仍是外部恢复索引，但不能覆盖 SQLite 事实。
 
 ## 12. 异常与恢复策略
 
@@ -1059,8 +1161,8 @@ acceptanceDelta:
 
 ### 12.10 运行中调整并发度
 
-- 升高：更新 `maxActiveWorkers`，从已经规划的就绪队列补充派发，不重新拆分已运行任务。
-- 降低：更新上限并暂停新派发；现有 Worker 自然完成，不自动取消。
+- 升高：同时更新 ledger 与当前 manifest 的 `maxActiveWorkers`，重新编译激活后从已经规划的就绪队列补充派发，不重新拆分已运行任务。
+- 降低：同时更新 ledger 与 manifest 后暂停新派发；现有 Worker 自然完成，不自动取消。
 - 调整到超过 8：重建 `monitorGroups`，保持每组最多 8 个并启用轮转监控。
 - 用户给出的值无法满足当前工具或环境约束时，明确报告 `requested` 与可执行的 `effective`，不得静默替换。
 
@@ -1073,9 +1175,19 @@ acceptanceDelta:
 - 一次有界重规划后仍无有效进展，健康度改为 `STALLED`，生命周期进入 `BLOCKED`；保护成果后最多创建 1 个替代 Worker。
 - 恢复时 `controllerSeq` 必须从 `lastControllerSeq` 继续，重复或旧命令不得再次执行。
 
+### 12.12 账本初始化、写入或校验失败
+
+- 初始账本无法写入稳定目录、路径已被 Git 跟踪或本地 exclude 失败时，不创建 Worker。
+- 运行中 ledger 写失败时停止新的 create/message/title/Handoff，不重复已经发出的工具调用。
+- 把运行报告为 `DEGRADED`，说明受影响 operation、最后成功 revision 和恢复选项。
+- 优先修复原账本；必要时把已验证 backup 恢复到新文件，`restore` 不自动覆盖或 promote。
+- 运行 `verify + status + pending + audit` 通过后才恢复派发。
+- ledger 丢失而任务仍存在时，用新文件保守重建并标记 `reconstructed`；不能唯一匹配时保持阻塞。
+- 不把内存表格或标题当作等价替代，也不因账本故障自动归档或重建 Worker。
+
 ## 13. Skill 文件结构
 
-建议实现为仓库级 Skill：
+实现为仓库级 Skill：
 
 ```text
 .agents/
@@ -1084,11 +1196,19 @@ acceptanceDelta:
         ├── SKILL.md
         ├── agents/
         │   └── openai.yaml
-        └── references/
-            ├── protocol.md
-            ├── tool-contracts.md
-            ├── worker-prompt.en.md
-            └── worker-prompt.zh-CN.md
+        ├── references/
+        │   ├── dispatch.md
+        │   ├── ledger.md
+        │   ├── protocol.md
+        │   ├── tool-contracts.md
+        │   ├── worker-prompt.en.md
+        │   └── worker-prompt.zh-CN.md
+        └── scripts/
+            ├── dispatch.py
+            ├── ledger.py
+            ├── orchestration_common.py
+            └── sql/
+                └── 001_initial.sql
 ```
 
 职责：
@@ -1100,7 +1220,7 @@ acceptanceDelta:
   - 主控六阶段调度算法。
   - 并发、写入和验收守则。
   - 严禁自动归档。
-  - 何时读取两个 reference。
+  - 何时读取四个流程 reference 和一个匹配语言的 Prompt。
 - `references/tool-contracts.md`
   - 官方 App Server 原语。
   - 当前 `codex_app.*` 工具调用形态。
@@ -1108,6 +1228,12 @@ acceptanceDelta:
   - worktree 起始状态、Handoff 与成果回收。
   - 默认 8 并发及大于 8 时的监控分组。
   - 工具缺失和返回值边界。
+- `references/ledger.md`
+  - 稳定路径、Git 本地排除、单写者和隐私。
+  - SQLite schema、事件、intent/outcome、备份、恢复和接管。
+- `references/dispatch.md`
+  - manifest 字段、DAG、worktree 和写边界规则。
+  - ready 选择、Prompt/消息/标题 renderer。
 - `references/protocol.md`
   - 双语 Prompt 的选择规则。
   - 状态消息格式。
@@ -1121,20 +1247,26 @@ acceptanceDelta:
 - `agents/openai.yaml`
   - UI 名称和默认 Prompt。
   - `allow_implicit_invocation: true`，依靠严格 `description` 识别强意图。
+- `scripts/dispatch.py`
+  - 纯确定性校验、编译、ready 选择和 renderer。
+  - 不调用 Codex 工具，不写 SQLite。
+- `scripts/ledger.py`
+  - 唯一 SQLite writer 和只读 status/audit/export/verify 接口。
+  - 不调用 Codex 工具。
+- `scripts/orchestration_common.py`
+  - 协议常量、规范化 JSON、敏感值检测、ID 和边界校验。
+- `scripts/sql/001_initial.sql`
+  - schema version 1、索引和 append-only/终态 trigger。
 
-不建议加入脚本：
-
-- 调度动作必须由模型调用 Codex App 工具，普通 shell/Python 脚本不能替代这些受控工具。
-- 标题生成、状态表和 Prompt 填充足够简单，脚本只会增加维护面。
-- `agents/openai.yaml` 当前只能声明 MCP 类型的工具依赖，不能用它强制声明 Codex App 内置工具，所以工具预检必须写在 `SKILL.md`。
+加入脚本的理由是：持久账本、幂等 operation、DAG 和写边界属于适合机械强制的不变量。脚本仍不能替代模型使用受控 Codex App 工具；`agents/openai.yaml` 也不能把内置工具声明为 MCP 依赖，所以工具发现与实际调用继续由 `SKILL.md` 控制。
 
 建议 UI 元数据：
 
 ```yaml
 interface:
   display_name: "Codex Task Orchestrator"
-  short_description: "Coordinate independent Codex tasks as Controller and Workers"
-  default_prompt: "Use $orchestrate-codex-tasks to split this request into independent Codex Worker tasks, coordinate them, and synthesize the result in the language of the user's orchestration request."
+  short_description: "Coordinate Codex Workers with a durable local ledger"
+  default_prompt: "Use $orchestrate-codex-tasks to plan independent Codex Worker tasks, persist the run locally, coordinate and recover their work, and synthesize the verified result."
 
 policy:
   allow_implicit_invocation: true
@@ -1151,17 +1283,28 @@ policy:
 ├── README.md
 ├── README.zh-CN.md
 ├── DESIGN.md
+├── tests/
+│   ├── test_dispatch.py
+│   └── test_ledger.py
 └── .agents/
     └── skills/
         └── orchestrate-codex-tasks/
             ├── SKILL.md
             ├── agents/
             │   └── openai.yaml
-            └── references/
-                ├── protocol.md
-                ├── tool-contracts.md
-                ├── worker-prompt.en.md
-                └── worker-prompt.zh-CN.md
+            ├── references/
+            │   ├── dispatch.md
+            │   ├── ledger.md
+            │   ├── protocol.md
+            │   ├── tool-contracts.md
+            │   ├── worker-prompt.en.md
+            │   └── worker-prompt.zh-CN.md
+            └── scripts/
+                ├── dispatch.py
+                ├── ledger.py
+                ├── orchestration_common.py
+                └── sql/
+                    └── 001_initial.sql
 ```
 
 上传 GitHub 后，Skill 的稳定路径为：
@@ -1197,8 +1340,8 @@ https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/or
 
 官方说明：
 
-- [安装本地 Skill](https://developers.openai.com/codex/build-skills#install-curated-skills-for-local-use)
-- [Skill 的发现位置](https://developers.openai.com/codex/build-skills#where-to-save-skills)
+- [安装本地 Skill](https://learn.chatgpt.com/docs/build-skills#install-curated-skills-for-local-use)
+- [Skill 的发现位置](https://learn.chatgpt.com/docs/build-skills#where-to-save-skills)
 
 ### 14.3 仓库级安装
 
@@ -1307,9 +1450,10 @@ https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/or
 
 ### 场景 7：主控恢复
 
-- 通过 `runId` 搜索 Worker。
-- 用 `read_thread` 恢复状态。
-- 重复消息不导致状态倒退。
+- 从稳定目录打开 SQLite，执行 `verify + status + pending`。
+- 通过 `runId` 搜索 Worker，用即时 wait/read 形成 observed facts 并执行 `audit`。
+- 先核对含糊 operation，再导出 manifest 并重算 ready。
+- 重复消息不导致状态倒退，未证明失败的 create 不会重复执行。
 
 ### 场景 8：用户中途改需求
 
@@ -1424,12 +1568,78 @@ https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/or
 - 下一条命令必须使用更大的序号；重复的 `controllerSeq=014` 被 Worker 确认但不重复执行。
 - 消息频繁不被推断为 `HEALTHY`，健康度从最近可复核成果和范围变化恢复。
 
+### 场景 25：SQLite 初始化和 Git 隔离
+
+- 项目内默认创建 `.codex/runtime/orchestrate-codex-tasks/runs/<runId>/ledger.sqlite3`。
+- `.git/info/exclude` 包含本地规则，受版本控制的 `.gitignore` 不变。
+- `.codex` 或父目录 symlink 不能让状态目录解析到 `project-root` 之外。
+- 如果 runtime 路径已被跟踪或无法忽略，初始派发失败且没有 Worker 被创建。
+
+### 场景 26：create 调用结果含糊
+
+- `CREATE_THREAD` intent 已落盘并占用槽位，工具调用超时。
+- operation 保持 `INTENT/UNKNOWN`，task 保持 `DISPATCHING`。
+- 上下文恢复后先用任务列表核对 `threadId/clientThreadId`。
+- 没有证明失败前不创建第二个 W1。
+
+### 场景 27：manifest 写边界和依赖双重防线
+
+- dispatch validator 拒绝可同时活跃且写边界重叠的 W1/W2。
+- 即使绕过 ready 选择，ledger create intent 仍拒绝未验收依赖、超出 `maxActiveWorkers` 或与活跃 Worker 重叠的写边界。
+- 有依赖顺序的重叠边界只有在前置 Worker `ACCEPTED` 后才可派发。
+
+### 场景 28：上下文压缩后恢复完整队列
+
+- SQLite 保存当前规范化 manifest、所有 task 状态、终态最小映射、活跃 Worker 和 pending operation。
+- 即使旧终态超过 status 的详细记录上限，依赖的 `ACCEPTED/RETIRED` 最小映射仍完整。
+- Controller 导出 manifest，调用 `ready` 后得到与压缩前一致的候选集合。
+
+### 场景 29：账本备份和非破坏性恢复
+
+- cycle 完成或重大重规划前使用 SQLite backup API 创建一致副本。
+- backup 和 restore 后都执行 integrity 与不变量校验。
+- restore 只写到不存在的新文件并返回 `promoted=false`，不覆盖当前账本。
+- 用户决定切换前，Controller 完成 `verify + status + pending + audit`。
+
+### 场景 30：敏感数据拒绝
+
+- manifest/event/request 含 `token/password/privateKey/Authorization` 类字段、私钥块或常见密钥形态时 CLI 失败。
+- 完整 Worker Prompt 和原始工具日志不进入 operation request/response。
+- 数据库、backup、manifest 和 export 不出现在 Git 跟踪文件中。
+
+### 场景 31：新 manifest 静默漏掉 task
+
+- v1 manifest 中 W2 仍为 `QUEUED/DISPATCHING/DISPATCHED` 或有活跃 Worker，v2 不再包含 W2。
+- `activate-manifest` 返回 `MANIFEST_OMITS_ACTIVE_TASK`，当前 manifest 不变。
+- 只有先显式取消未创建的 W2，或完成成果处置并把已有 W2 安全推进到终态，才允许激活 v2。
+
+### 场景 32：cycle 和 run 终态防提前、防回退
+
+- 任一 Worker/task 非终态，或 operation 为 `INTENT/UNKNOWN` 时，`CYCLE_COMPLETED` 被拒绝。
+- cycle 只能按序号逐个启动；有活跃 cycle 时 `RUN_COMPLETED` 被拒绝。
+- run 完成后通用状态更新和 SQLite trigger 都不能把它重新改为 `ACTIVE`；最终标题仍通过独立 title intent 投影。
+
+### 场景 33：恢复校验和最小化 outcome
+
+- 恢复登记不能把 Worker 接到已取消或其他 terminal task，`RUNNING/REVIEW/BLOCKED` 必须有真实 `threadId`。
+- outcome 出现未列入该 operation kind 的原始工具字段时，整个事务回滚，原 intent 保持 pending。
+- `verify` 能检测 foreign-key、revision、内容哈希、地址、健康度、序号和终态不一致。
+
 ## 16. 完成标准
 
 Skill 实现完成后，应满足：
 
 - 所有 Worker 都是 `create_thread` 创建的独立任务。
 - 不出现 `spawn_agent` 或 Worker 自扩散。
+- 每次初始派发前都已创建并验证本地 SQLite 账本，项目 runtime 路径通过 `.git/info/exclude` 隔离。
+- 只有 Controller 通过 `ledger.py` 写账本；Worker Prompt 明确禁止访问账本。
+- manifest 经过协议、DAG、里程碑、worktree、槽位和写边界校验，并完整持久化。
+- create/message/title/Handoff 全部使用封闭字段、幂等 intent/outcome；恢复时 pending operation 不被盲目重试。
+- event append-only，task/Worker/run 终态、消息序号和主控序号不能通过通用状态更新或 SQL trigger 回退。
+- cycle 只能顺序推进，存在非终态 work 或 pending/unknown operation 时不能提前完成。
+- context 压缩后可以从 `verify/status/pending/audit + current manifest` 恢复，不依赖内存表格。
+- backup/restore 非破坏且经过校验，restore 不自动替换当前账本。
+- 敏感字段和密钥形态被拒绝，运行数据库及导出不进入 Git。
 - 每个 Worker Prompt 都包含主控 `threadId`。
 - 每个 Worker Prompt 都包含正确的 `runLanguage`，并使用对应的完整语言模板。
 - 跨主机 Worker 同时获得主控 `hostId`。
@@ -1461,6 +1671,12 @@ Skill 实现完成后，应满足：
 | 配置 | 默认值 |
 |---|---|
 | Skill 名称 | `orchestrate-codex-tasks` |
+| 协议版本 | 2 |
+| SQLite schema version | 1 |
+| 账本位置 | `<project>/.codex/runtime/orchestrate-codex-tasks/runs/<runId>/ledger.sqlite3` |
+| 账本 writer | 仅 Controller 通过 `ledger.py` |
+| 外部操作 | `intent -> actual tool -> sanitized outcome` |
+| Python | 3.9+，仅标准库 |
 | 激活方式 | 显式调用，或强意图自然语言隐式识别 |
 | 隐式调用 | 启用，但 `description` 仅匹配明确创建独立任务的意图 |
 | 协调语言 | 根据用户编排请求选择 `en` 或 `zh-CN` |
@@ -1506,12 +1722,16 @@ Skill 实现完成后，应满足：
 10. 主控必须判断 Worker 是否过重、冗余、范围膨胀或陷入低效长尾，并通过 `CHECKPOINT/REPLAN` 在原授权内优化。
 11. 时间阈值只触发健康审查，不能自动停止、废弃或替代 Worker。
 12. 健康度不新增生命周期图标；效率审查使用标题后缀，真正等待重规划时使用 `⌛️`。
+13. 主控账本持久化到本地 SQLite，不能只保存在上下文；Worker 不访问账本。
+14. 调度、Prompt、标题和命令采用脚本做确定性校验/渲染，但脚本不调用 Codex 任务工具。
+15. 任务创建、跨任务消息、改名和 Handoff 使用 intent/outcome，恢复先处理 pending operation。
+16. 账本默认放入项目 `.codex/runtime` 并仅通过 `.git/info/exclude` 本地排除；严禁上传账本和敏感数据。
 
 当前没有阻塞第一版建设的待确认项。运行时出现的基线选择、远程项目歧义、额外权限或成果回收冲突，均由 Skill 的预检和 `BLOCKED` 协议处理，不需要在设计阶段预先猜测。
 
 ## 19. 建设计划与就绪判定
 
-可以开始建设 Skill。实施顺序固定为：
+第一版已按以下顺序完成建设；发布前必须再次逐项验收：
 
 1. 使用官方 `skill-creator` 的初始化脚本，在仓库内创建 `.agents/skills/orchestrate-codex-tasks/`。
 2. 编写精简的 `SKILL.md`：
@@ -1520,10 +1740,13 @@ Skill 实现完成后，应满足：
    - 正文控制在 500 行以内。
 3. 将详细工具契约、Handoff、远程主机和异常恢复放入 `references/tool-contracts.md`。
 4. 将双向消息格式、双语标题状态机、健康度、`CHECKPOINT/REPLAN`、语言切换和恢复规则放入 `references/protocol.md`。
-5. 将完整 Worker Prompt 分别放入 `references/worker-prompt.en.md` 和 `references/worker-prompt.zh-CN.md`，运行时只读取匹配 `runLanguage` 的一份。
-6. 依据最终 Skill 内容生成 `agents/openai.yaml`，启用严格描述驱动的隐式选择。
-7. 运行官方 `quick_validate.py`。
-8. 执行静态审计：
+5. 将 SQLite 路径、schema、单写者、intent/outcome、备份、恢复和隐私规则放入 `references/ledger.md`。
+6. 将 manifest、DAG、ready、写边界和 renderer 契约放入 `references/dispatch.md`。
+7. 实现 `scripts/orchestration_common.py`、`scripts/dispatch.py`、`scripts/ledger.py` 和 `scripts/sql/001_initial.sql`。
+8. 将完整 Worker Prompt 分别放入 `references/worker-prompt.en.md` 和 `references/worker-prompt.zh-CN.md`，运行时只读取匹配 `runLanguage` 的一份，并禁止 Worker 访问主控账本。
+9. 依据最终 Skill 内容生成 `agents/openai.yaml`，启用严格描述驱动的隐式选择。
+10. 运行官方 `quick_validate.py` 和 Python 3.9/当前 Python 单元测试。
+11. 执行静态审计：
    - 全仓只使用 `Prompt` 术语；
    - 默认并发值必须为 8；
    - 不出现 `spawn_agent` 调度路径；
@@ -1534,7 +1757,9 @@ Skill 实现完成后，应满足：
    - `controllerSeq` 必须严格递增，重复或旧命令不得重复执行。
    - 时间阈值只触发效率审查，不得出现按时长自动终止 Worker 的规则。
    - README.md 与 README.zh-CN.md 必须互相链接。
-9. 对第 15 节场景做无副作用的结构化演练。
-10. 只有用户明确要求进行真实端到端测试时，才实际创建独立 Worker 任务；测试完成后按结果标记 `✅` 或 `🗑️`，不自动归档。
+   - runtime ledger 路径必须被本地 Git 排除，测试不能产生可上传账本。
+   - 外部 operation 必须先 intent 后 outcome，完整 Prompt 和凭据不得落账。
+12. 对第 15 节场景做无副作用的结构化演练，并执行 SQLite 故障、幂等、恢复、DAG、写边界和敏感值测试。
+13. 只有用户明确要求进行真实端到端测试时，才实际创建独立 Worker 任务；测试完成后按结果标记 `✅` 或 `🗑️`，不自动归档。
 
 以上步骤完成并通过校验后，第一版即可发布到 GitHub 并通过 `$skill-installer` 安装。
