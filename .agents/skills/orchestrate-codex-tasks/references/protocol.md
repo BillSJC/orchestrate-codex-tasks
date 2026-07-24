@@ -9,9 +9,10 @@
 5. 主控到 Worker 的消息
 6. 本地化标题和状态机
 7. 运行账本
-8. 并发调整
-9. 运行中切换语言
-10. 恢复与去重
+8. 效率检查与重规划
+9. 并发调整
+10. 运行中切换语言
+11. 恢复与去重
 
 ## 1. 运行身份
 
@@ -76,6 +77,12 @@
 summary: <one-line status in runLanguage>
 details:
 - <key fact or result in runLanguage>
+milestone: <current observable milestone in runLanguage>
+completed:
+- <acceptance item closed since the previous message, or none>
+remaining:
+- <remaining acceptance item>
+estimate: <estimated remaining time, or unknown with a reason>
 next:
 - <next action in runLanguage; use none for DONE>
 needs:
@@ -93,13 +100,26 @@ evidence:
 
 `seq` 从 `001` 开始单调增加。每个消息只表达一个主要状态变化。
 
-### 4.1 BLOCKED 最低内容
+### 4.1 ACCEPTED 与 PROGRESS 最低内容
+
+- `ACCEPTED` 必须给出 2–5 个可观察里程碑、首个健康检查点和已知长命令的预期墙钟时间。
+- `PROGRESS` 必须说明本次关闭了哪个验收项；没有关闭时写 `none` 并解释仍有价值的进展。
+- 长命令开始前发送一次 `PROGRESS`，写明命令、预期墙钟时间、不可安全中断的边界和超时处理。
+- 消息频繁不等于有效进展；主控用 `completed` 和 `lastUsefulProgressAt` 判断健康度。
+
+### 4.2 BLOCKED 最低内容
 
 ```text
 summary: <blocker in runLanguage>
 details:
 - facts: <confirmed facts in runLanguage>
 - cause: <why work cannot continue in runLanguage>
+milestone: <blocked milestone>
+completed:
+- <last closed acceptance item or none>
+remaining:
+- <work blocked by this decision>
+estimate: blocked
 next:
 - option-a: <option and impact in runLanguage>
 - option-b: <option and impact in runLanguage>
@@ -110,7 +130,7 @@ evidence:
 - <relevant file, error, or tool result>
 ```
 
-### 4.2 DONE 最低内容
+### 4.3 DONE 最低内容
 
 ```text
 summary: <completed result in runLanguage>
@@ -118,6 +138,12 @@ details:
 - deliverables: <deliverables>
 - changed-files: <file list or none>
 - residual-risks: <residual risks in runLanguage or none>
+milestone: complete
+completed:
+- <all closed acceptance items>
+remaining:
+- none
+estimate: none
 next:
 - none
 needs:
@@ -143,22 +169,27 @@ acceptanceDelta:
 `COMMAND` 只能是：
 
 - `DECISION`：回答阻塞问题。
+- `CHECKPOINT`：要求 Worker 在下一个安全边界暂停新阶段，并用 `PROGRESS` 回报已完成/剩余验收、文件与未提交成果、冗余工作、可拆分单元和预计剩余时间。
+- `REPLAN`：只在原始授权内调整执行顺序、批量授权、文件所有权或剩余职责；不能放宽验收或扩大外部影响。
 - `REVISION`：验收失败，要求在原范围内修订。
 - `SCOPE_UPDATE`：用户已经授权范围变化。
 - `LANGUAGE_UPDATE`：用户明确要求切换协调语言。
 - `STOP`：用户明确停止，或原任务已失去价值；主控完成成果处置审计后进入 `RETIRED`。
 
-主控不能用 `SCOPE_UPDATE` 自行扩大用户授权，也不能把交付物语言变化误写成 `LANGUAGE_UPDATE`。
+`controllerSeq` 从 `001` 开始严格单调增加。Worker 保存 `lastControllerSeq`，只执行更大的序号；重复或更旧的命令不得重复执行，只用 `PROGRESS` 确认已忽略并给出已应用的最新序号。
+
+主控不能用 `REPLAN` 或 `SCOPE_UPDATE` 自行扩大用户授权，也不能把交付物语言变化误写成 `LANGUAGE_UPDATE`。
 
 ## 6. 本地化标题和状态机
 
 ### 6.1 英文主控标题
 
-以下五行依次对应 `PLANNING`、`TRACKING`、`WAITING_FOR_USER`、`SYNTHESIZING` 和 `COMPLETE`：
+以下六行依次对应 `PLANNING`、`TRACKING`、`REPLANNING`、`WAITING_FOR_USER`、`SYNTHESIZING` 和 `COMPLETE`：
 
 ```text
 👑 [<runId>] Planning | <overall goal>
 👑 [<runId>] Tracking <N> Workers | <overall goal>
+👑 [<runId>] Replanning | <overall goal>
 👑 [<runId>] Waiting for user decision | <overall goal>
 👑 [<runId>] Synthesizing | <overall goal>
 👑 [<runId>] Complete | <overall goal>
@@ -166,11 +197,12 @@ acceptanceDelta:
 
 ### 6.2 中文主控标题
 
-以下五行依次对应 `PLANNING`、`TRACKING`、`WAITING_FOR_USER`、`SYNTHESIZING` 和 `COMPLETE`：
+以下六行依次对应 `PLANNING`、`TRACKING`、`REPLANNING`、`WAITING_FOR_USER`、`SYNTHESIZING` 和 `COMPLETE`：
 
 ```text
 👑 [<runId>] 拆解｜<总体目标>
 👑 [<runId>] 跟进 <N> 个 Worker｜<总体目标>
+👑 [<runId>] 重规划｜<总体目标>
 👑 [<runId>] 等待用户确认｜<总体目标>
 👑 [<runId>] 汇总｜<总体目标>
 👑 [<runId>] 完成｜<总体目标>
@@ -204,6 +236,15 @@ acceptanceDelta:
 
 图标必须是第一个字符。Worker 不自行改名。不得使用 `📋` 表达报告、审计、设计或“无合入物”；交付物类型写在标题后缀，生命周期通过验收后使用 `✅`。
 
+健康度不增加新的生命周期图标。效率审查时可使用：
+
+```text
+✍️ [<runId>-<workerId>] <action phrase> | Efficiency review
+✍️ [<runId>-<workerId>] <动宾短语>｜效率审查
+⌛️ [<runId>-<workerId>] <action phrase> | Waiting for replanning
+⌛️ [<runId>-<workerId>] <动宾短语>｜等待重规划
+```
+
 ### 6.5 状态映射
 
 | 状态 | 标题前缀 | 含义 |
@@ -231,7 +272,19 @@ PROVISIONING/RUNNING/REVIEW/BLOCKED -> RETIRED
 
 Worker 自称 `DONE` 只触发 `REVIEW` 和 `🔍`。只有主控验收并通过归档就绪门后才能进入 `ACCEPTED` 和 `✅`。停止、取消或取代也必须通过归档就绪门，才能进入 `RETIRED` 和 `🗑️`。
 
-### 6.6 归档就绪门
+### 6.6 调度健康度
+
+健康度与生命周期正交：
+
+| 健康度 | 含义 |
+|---|---|
+| `HEALTHY` | 正在按计划关闭里程碑，或处于已声明的合法长命令窗口 |
+| `AT_RISK` | 触发软阈值，主控正在 checkpoint 或重规划；不代表失败 |
+| `STALLED` | 一次有界重规划后仍没有有效进展，或确实等待外部决定；进入 `BLOCKED` |
+
+时间只能触发审查，不能直接触发 `STOP`、`RETIRED` 或替代 Worker。
+
+### 6.7 归档就绪门
 
 `ACCEPTED` 与 `RETIRED` 都是终态，并设置 `archiveReady=true`；两者都允许用户直接人工归档，但本 Skill 不自动调用归档工具。
 
@@ -271,8 +324,19 @@ Worker 自称 `DONE` 只触发 `REVIEW` 和 `🔍`。只有主控验收并通过
 | `writeBoundary` | 文件所有权 |
 | `integrationPlan` | Handoff 或用户认可的替代方式 |
 | `lastSeq` | 已处理 Worker 消息序号 |
+| `lastControllerSeq` | Worker 已应用的最新主控命令序号 |
 | `cursor` | 等待工具 cursor |
 | `result` | 验收结果摘要 |
+| `health` | `HEALTHY/AT_RISK/STALLED` |
+| `currentMilestone` | 当前可观察里程碑 |
+| `closedAcceptanceItems` | 已关闭的验收项 |
+| `remainingAcceptanceItems` | 剩余验收项 |
+| `lastUsefulProgressAt` | 最近一次关闭验收项或产生可复核成果的时间 |
+| `estimatedRemaining` | Worker 当前估计及理由 |
+| `decisionRoundTrips` | 可预见的主控逐步放行往返数 |
+| `scopeDeltaCount` | 新增验收族、子系统或写入边界次数 |
+| `timeoutCount` | timeout 次数 |
+| `nextHealthReviewAt` | 下一次效率复查点 |
 | `archiveReady` | 仅 `ACCEPTED/RETIRED` 且归档就绪门通过时为 `true` |
 | `terminalReason` | 完成摘要或废弃原因 |
 | `replacementWorkerId` | 被取代时填写，否则 `none` |
@@ -290,8 +354,30 @@ Worker 自称 `DONE` 只触发 `REVIEW` 和 `🔍`。只有主控验收并通过
 | `queuedCount` | 未创建的规划任务数 |
 | `monitorGroups` | 每组最多 8 个 Worker |
 | `localPreferred` | 默认 `true` |
+| `oneToOneSince` | 只有一个活跃 Worker 且无队列时的起始时间；否则为空 |
 
-## 8. 并发调整
+## 8. 效率检查与重规划
+
+满足任一条件时把 Worker 标记为 `AT_RISK` 并进行审查：
+
+1. 约 30 分钟没有关闭验收项，且不在已声明长命令窗口；长命令超过预期约 2 倍或已无执行迹象也触发。
+2. 连续 3 条 `PROGRESS` 没有关闭里程碑。
+3. 出现 3 次可预见的逐步放行往返。
+4. 新增原计划之外的验收族、顶层子系统或写入边界。
+5. 出现 timeout、重复诊断、上下文压缩、序号重复或同一失败路径反复尝试。
+6. `activeCount=1`、`queuedCount=0` 持续约 15 分钟，且剩余工作可独立拆分。
+
+主控执行：
+
+1. 使用 `REPLANNING` 标题，向 Worker 发送 `CHECKPOINT`。
+2. 核对已完成/剩余验收、文件与未提交成果、ETA、冗余执行、可拆分单元和下一条不可中断命令。
+3. 在原始授权内选择：继续并设下一检查点；发送 `REPLAN` 批量授权有界 manifest；删除被更强证据覆盖的重复执行；拆分独立剩余工作；或在成果保护后替换 Worker。
+4. 有未提交唯一成果的写入型 Worker 必须先完成授权内的 checkpoint、Handoff 或其他持久化，不能直接创建第二个写入者接管同一边界。
+5. 向用户报告触发原因、决定、并发变化、下一检查点和风险。
+
+批量授权应使用“首个 nonzero/timeout 即停”，避免每个可预见步骤都等待主控批准。`REPLAN` 不得降低验收、扩大范围、自动提交或制造低价值并发。只有一次有界重规划后仍无有效进展，才进入 `STALLED/BLOCKED`。
+
+## 9. 并发调整
 
 解析：
 
@@ -308,7 +394,7 @@ effective = min(requested, 值得独立派发且已就绪的任务数, 当前环
 - 非正整数、含糊范围或环境不支持时请求修正或报告可执行值。
 - 每次改变都使用 `runLanguage` 报告旧值、新值、活跃数和排队数。
 
-## 9. 运行中切换语言
+## 10. 运行中切换语言
 
 初始 `runLanguage` 在本次运行中保持稳定。普通术语切换、代码、引用材料或交付物语言变化都不触发协调语言切换。
 
@@ -320,14 +406,17 @@ effective = min(requested, 值得独立派发且已就绪的任务数, 当前环
 4. Worker 从下一条消息开始使用新语言，不重写历史消息。
 5. 新创建的 Worker 使用新语言对应的完整 Worker Prompt。
 
-## 10. 恢复与去重
+## 11. 恢复与去重
 
 1. 用 `runId` 搜索标题。
 2. 列出任务并匹配 `runId-workerId`。
 3. 从运行账本恢复 `runLanguage`；账本缺失时，从主控标题和最近一条实质性用户请求恢复。
 4. 读取近期任务状态。
 5. 只接受比 `lastSeq` 更新的 Worker 消息。
-6. `ACCEPTED/RETIRED` 后的旧 `PROGRESS` 或 `DONE` 不回退状态。
-7. `REVISION` 保持相同 Worker ID，消息序号继续增加。
-8. 不因上下文丢失重复创建 Worker。
-9. 不因恢复、失败、完成或停止而自动归档任何任务；只恢复已有 `archiveReady` 值，不推断或自动执行归档。
+6. 恢复每个 Worker 的 `lastControllerSeq`；新命令从更大序号继续，绝不复用旧序号。
+7. Worker 忽略重复或更旧的 `controllerSeq`，主控也不因确认消息再次执行相同决定。
+8. `ACCEPTED/RETIRED` 后的旧 `PROGRESS` 或 `DONE` 不回退状态。
+9. `REVISION` 保持相同 Worker ID，消息序号继续增加。
+10. 恢复健康字段；缺失时从最近的可复核成果、timeout 和范围变化保守重建，不把消息频繁推断为 `HEALTHY`。
+11. 不因上下文丢失重复创建 Worker。
+12. 不因恢复、失败、完成或停止而自动归档任何任务；只恢复已有 `archiveReady` 值，不推断或自动执行归档。

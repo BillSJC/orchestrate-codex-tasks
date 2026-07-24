@@ -44,6 +44,7 @@
 8. 允许 Worker 写代码；凡是会修改项目文件的 Worker，默认创建在独立 worktree 中。
 9. 默认最多同时保留 8 个未完成 Worker；用户可以在每次运行开始前或运行期间明确调整该值。
 10. 支持本地和远程 `hostId`，但没有用户或环境上的特殊要求时优先选择本地主机。
+11. 主控必须区分“任务存活”和“有效进展”，在 Worker 过重、重复、范围膨胀或陷入长尾时主动请求 checkpoint，并在原授权内重规划。
 
 ### 2.2 不做什么
 
@@ -54,6 +55,8 @@
 - 不把当前 Codex App 暴露的高层工具误写成稳定的公开 OpenAI API。
 - 不创建无上限 Worker；使用有限并发和波次调度。
 - 不自动归档任何主控或 Worker 任务。
+- 不因时间阈值自动停止 Worker；时间只触发效率审查。
+- 不把 commentary 数量、频繁轮询或逐步微授权当成吞吐量。
 
 ### 2.3 I18N 与运行语言
 
@@ -328,6 +331,7 @@ flowchart TD
     C -.->|"wait_threads + read_thread"| W1
     C -.->|"wait_threads + read_thread"| W2
     C -.->|"wait_threads + read_thread"| WN
+    C -->|"CHECKPOINT / REPLAN"| W1
 ```
 
 核心原则是 **单一决策中心、多个执行单元、双向通信、主控验收**。
@@ -337,6 +341,7 @@ Worker 可以分析、实现或验证，但以下职责只属于主控：
 - 是否改变总体范围。
 - 是否接受风险或扩大权限。
 - 如何解决 Worker 之间的冲突。
+- Worker 是否过重、重复或进入低效长尾，以及是否继续、批量放行、拆分或替换。
 - 如何整合最终结果。
 - 是否需要向用户提出澄清。
 - 何时把 Worker 标记为完成。
@@ -412,7 +417,7 @@ Skill 的 frontmatter `description` 应同时写清正向触发词和排除条�
 ```yaml
 ---
 name: orchestrate-codex-tasks
-description: Coordinate a controller task with multiple independent Codex Worker tasks using task creation, cross-task messages, status titles, monitoring, and result synthesis. Use when the user explicitly asks to create separate, independent, or background Codex tasks/threads, requests a controller + Worker workflow, or says “主控 + Worker”, “独立任务并发”, or “跨任务并发”. Do not use for Codex subagents, generic requests to work faster, shell/program concurrency, or when the user has not authorized creating new tasks.
+description: Coordinate the current Codex task as a Controller with multiple independent Codex Worker tasks/threads through task creation, cross-task messages, status-title updates, health checks, adaptive replanning, worktree isolation, and result synthesis. Run all visible coordination in English or Chinese to match the user's orchestration request. Use only when the user explicitly invokes this skill to execute work or clearly asks for separate, independent, or background Codex tasks, a Controller + Worker workflow, cross-task coordination, “主控 + Worker”, “独立任务并发”, or “跨任务并发”. Do not use for Codex subagents, generic requests to work faster, vague parallelism, shell/program concurrency, simple tightly coupled work, or requests that do not authorize creating new Codex tasks.
 ---
 ```
 
@@ -497,6 +502,18 @@ effective = min(requested, 当前可执行且值得独立派发的子任务数, 
 - 用户偏好、业务权衡和风险接受。
 - 共享接口的最终定稿。
 
+### 7.2.1 派发前任务重量审查
+
+每个 Worker 规划 2–5 个可观察里程碑，并记录首个健康检查点。下列是软拆分信号：
+
+- 跨越多个顶层子系统或工具链。
+- 包含两个以上可以独立验收的生产目标。
+- 同时承担实现、规格、TDD、完整回归和最终集成。
+- 写入边界横跨多个顶层目录，或存在大量未知前置。
+- 预计需要连续多轮主控决策才能推进。
+
+命中任一信号时，主控优先继续拆分；确实因共享状态、单一脏 worktree 或强依赖无法拆分时，必须记录不可拆原因、里程碑、预计最慢合法命令和第一次效率复查时间。重量审查不是机械文件数限制，也不能为了拆分而制造多个写入者。
+
 ### 7.3 建立小型依赖图
 
 主控先建立一个轻量 DAG：
@@ -564,6 +581,7 @@ W3: 设计测试场景 ─┘
 👑 [R7K2] 拆解｜设计任务并发 Skill
 👑 [R7K2] 调度｜设计任务并发 Skill
 👑 [R7K2] 跟进 8 个 Worker｜设计任务并发 Skill
+👑 [R7K2] 重规划｜设计任务并发 Skill
 👑 [R7K2] 汇总｜设计任务并发 Skill
 👑 [R7K2] 等待主人确认｜设计任务并发 Skill
 👑 [R7K2] 完成｜设计任务并发 Skill
@@ -586,6 +604,8 @@ Worker：
 ```
 
 图标必须是标题的第一个字符，不在图标前增加其他标记。不得使用 `📋` 表达报告、审计、设计或“无合入物”；交付物类型写入后缀，生命周期验收通过后仍使用 `✅`。
+
+健康度不增加新的生命周期图标。效率审查中继续推进时使用 `✍️ ...｜效率审查`；暂停等待新计划时使用 `⌛️ ...｜等待重规划`。账本另存 `HEALTHY/AT_RISK/STALLED`。
 
 ### 8.2 Worker 状态转换
 
@@ -622,7 +642,7 @@ Worker 自称完成后，主控先进入 `REVIEW` 并改为 `🔍`；只有验�
 
 ## 9. Worker Prompt 模板
 
-以下模板应放入 Skill 的 `references/protocol.md`，由主控按子任务填充后传给 `create_thread`。
+以下为协议示意；实际完整模板分别位于 `references/worker-prompt.en.md` 与 `references/worker-prompt.zh-CN.md`，由主控按 `runLanguage` 选择、填充后传给 `create_thread`。
 
 ```text
 你是一个独立 Codex Worker 任务，不是 Codex 子 Agent。
@@ -646,6 +666,8 @@ Worker 自称完成后，主控先进入 `REVIEW` 并改为 `🔍`；只有验�
 - 成果回收方式：{{INTEGRATION_PLAN}}
 - 期望交付物：{{DELIVERABLES}}
 - 验收与验证：{{ACCEPTANCE}}
+- 可观察里程碑：{{MILESTONES}}
+- 首个健康检查点与已知长命令：{{HEALTH_CHECKPOINT}}
 
 强制协作协议
 1. 这是主控拆出的子任务。不要创建子 Agent、其他 Codex 任务或新的 Worker。
@@ -661,11 +683,14 @@ Worker 自称完成后，主控先进入 `REVIEW` 并改为 `🔍`；只有验�
    - 使用 send_message_to_thread 向 controllerThreadId 发送 BLOCKED 消息；
    - 给出阻塞原因、已经确认的事实、可选方案、推荐方案和不决策的影响；
    - 等待主控回复。可以继续处理与阻塞无关且明确安全的工作。
-5. 有实质性里程碑时向主控发送 PROGRESS 消息，但不要发送无信息量心跳。
-6. 完成时必须先向主控发送 DONE 消息，包含结果、证据、验证、文件或链接、残余风险；发送后再结束本任务。DONE 只是完成声明，主控验收期间使用 `🔍`。
-7. 收到 STOP 时停止受影响工作，保留可恢复证据，用 PROGRESS 和 `next: none` 确认停止；目标没有真正完成时不得声称 DONE。
-8. 主控负责最终决策、`✅/🗑️` 终态和归档就绪审计。不要向主人宣称总体任务已经完成。
-9. 如果允许写代码：
+5. 有实质性里程碑时向主控发送 PROGRESS，包含当前里程碑、新关闭和剩余验收项及带理由的 ETA；长命令开始前报告预期墙钟时间和安全中断边界。
+6. 保存最大 `controllerSeq`，只执行更大序号；重复或更旧命令只确认、不重复执行。
+7. 收到 CHECKPOINT 时在安全边界暂停新阶段，回报已完成/剩余验收、文件与未提交成果、冗余工作、可拆分单元、ETA 和下一条不可中断命令。
+8. 收到 REPLAN 时只调整原授权内的执行形状，不扩大范围或降低验收。
+9. 完成时必须先向主控发送 DONE 消息，包含结果、证据、验证、文件或链接、残余风险；发送后再结束本任务。DONE 只是完成声明，主控验收期间使用 `🔍`。
+10. 收到 STOP 时停止受影响工作，保留可恢复证据，用 PROGRESS 和 `next: none` 确认停止；目标没有真正完成时不得声称 DONE。
+11. 主控负责最终决策、`✅/🗑️` 终态和归档就绪审计。不要向主人宣称总体任务已经完成。
+12. 如果允许写代码：
    - 只修改“文件写入边界”允许的路径；
    - 在独立 worktree 内完成实现与测试；
    - 不自行 Handoff 到 Local；
@@ -684,6 +709,12 @@ send_message_to_thread({
 summary: <一句话状态>
 details:
 - <关键事实或产出>
+milestone: <当前可观察里程碑>
+completed:
+- <本次新关闭的验收项；没有则 none>
+remaining:
+- <剩余验收项>
+estimate: <预计剩余时间；未知时给出理由>
 next:
 - <下一步；DONE 时写 none>
 needs:
@@ -716,9 +747,14 @@ acceptanceDelta:
 `COMMAND` 只能使用：
 
 - `DECISION`：回答 Worker 的阻塞问题。
+- `CHECKPOINT`：要求 Worker 在安全边界暂停新阶段并返回成果与剩余工作快照。
+- `REPLAN`：在原始授权内调整顺序、批量授权或剩余职责。
 - `REVISION`：验收未通过，要求在原范围内修订。
 - `SCOPE_UPDATE`：用户已授权范围变化。
+- `LANGUAGE_UPDATE`：用户明确要求切换协调语言。
 - `STOP`：用户明确要求停止，或原任务已失去价值。
+
+`controllerSeq` 必须严格单调增加；恢复后从账本中的 `lastControllerSeq` 继续，不能复用旧序号。
 
 ## 10. 主控调度算法
 
@@ -807,6 +843,34 @@ acceptanceDelta:
 
 不要把每次 30 秒轮询都变成无信息量消息；只有达到用户侧心跳时间或发生状态变化时才汇报。
 
+### 阶段 C.1：效率审查与重规划
+
+主控不把消息频率当成进展，持续更新 `currentMilestone`、`closedAcceptanceItems`、`remainingAcceptanceItems`、`lastUsefulProgressAt` 和 `estimatedRemaining`。
+
+以下任一条件是软触发，不是自动停止：
+
+1. 约 30 分钟没有关闭验收项，且不在已声明长命令窗口；长命令超过预计约 2 倍或无执行迹象也触发。
+2. 连续 3 条 `PROGRESS` 没有关闭里程碑。
+3. 发生 3 次可预见的逐步放行往返。
+4. 新增原计划之外的验收族、顶层子系统或写入边界。
+5. 出现 timeout、重复诊断、上下文压缩、序号重复或同一失败路径反复尝试。
+6. `activeCount=1`、`queuedCount=0` 持续约 15 分钟，且剩余工作可拆分。
+
+触发后：
+
+1. 健康度改为 `AT_RISK`，主控标题改为 `👑 [runId] 重规划｜总体目标`。
+2. 向 Worker 发送 `CHECKPOINT`，要求在安全边界暂停新阶段并返回已完成/剩余验收、文件与未提交成果、冗余执行、可拆分工作和 ETA。
+3. 主控在原始授权内选择：
+   - 继续并设置下一个可验证里程碑和复查时间；
+   - 用 `REPLAN` 一次性授权已核对的有界 manifest，首个 nonzero/timeout 即停；
+   - 删除被更强证据覆盖的重复执行，但不降低验收标准；
+   - 收窄原 Worker，把独立剩余工作拆给新 Worker；
+   - 一次有界重规划后仍无进展时，在保护成果后替换 Worker。
+4. 脏 worktree 的唯一成果未 checkpoint/Handoff/持久化前，不创建第二个写入者接管同一边界。
+5. 立即向用户报告触发原因、决定、并发变化、下一检查点和风险。
+
+只有一次有界重规划后仍没有有效进展，或确实等待外部决定时，才进入 `STALLED/BLOCKED`。时间阈值本身不能触发 `STOP`、`RETIRED` 或自动归档。
+
 ### 阶段 D：处理阻塞
 
 收到 `BLOCKED` 后：
@@ -889,8 +953,19 @@ acceptanceDelta:
 | `writeBoundary` | 文件所有权 |
 | `integrationPlan` | Handoff 或用户明确授权的替代回收方式 |
 | `lastSeq` | 已处理的最新 Worker 消息序号 |
+| `lastControllerSeq` | Worker 已应用的最新主控命令序号 |
 | `cursor` | `wait_threads` 增量游标 |
 | `result` | 验收后的结果摘要 |
+| `health` | `HEALTHY/AT_RISK/STALLED`，与生命周期正交 |
+| `currentMilestone` | 当前可观察里程碑 |
+| `closedAcceptanceItems` | 已关闭的验收项 |
+| `remainingAcceptanceItems` | 剩余验收项 |
+| `lastUsefulProgressAt` | 最近可复核成果或验收关闭时间 |
+| `estimatedRemaining` | Worker 当前 ETA 及理由 |
+| `decisionRoundTrips` | 可预见的逐步放行往返数 |
+| `scopeDeltaCount` | 新增验收族、子系统或写入边界次数 |
+| `timeoutCount` | timeout 次数 |
+| `nextHealthReviewAt` | 下一次效率复查点 |
 | `archiveReady` | 仅归档就绪门通过后的 `ACCEPTED/RETIRED` 为 `true` |
 | `terminalReason` | 成功完成摘要或废弃原因 |
 | `replacementWorkerId` | 被取代时填写，否则为 `none` |
@@ -907,13 +982,14 @@ acceptanceDelta:
 | `queuedCount` | 尚未创建且依赖未满足或等待槽位的 Worker 数 |
 | `monitorGroups` | 每组最多 8 个 Worker 的稳定监控分组 |
 | `localPreferred` | 固定为 `true`，除非用户明确指定远程优先 |
+| `oneToOneSince` | 只有一个活跃 Worker 且无队列时的起始时间；否则为空 |
 
 如果主控因压缩或恢复而丢失局部状态，可通过：
 
 1. `runId` 搜索任务标题。
 2. `list_threads` 重建 Worker 列表。
 3. `read_thread` 重建最近状态。
-4. 根据消息中的 `seq` 去重。
+4. 根据消息中的 `seq` 去重，并从 `lastControllerSeq` 继续严格递增的主控命令。
 
 任务标题中的 `runId-workerId` 是恢复机制的一部分，不只是装饰。
 
@@ -987,6 +1063,15 @@ acceptanceDelta:
 - 降低：更新上限并暂停新派发；现有 Worker 自然完成，不自动取消。
 - 调整到超过 8：重建 `monitorGroups`，保持每组最多 8 个并启用轮转监控。
 - 用户给出的值无法满足当前工具或环境约束时，明确报告 `requested` 与可执行的 `effective`，不得静默替换。
+
+### 12.11 Worker 过重、冗余或陷入长尾
+
+- 先区分合法长命令、真实阻塞和“消息活跃但验收不关闭”。
+- 触发软阈值后发送 `CHECKPOINT`，不因时间直接停止或复制 Worker。
+- 能在原范围优化时发送 `REPLAN`：批量授权有界 manifest、移除重复执行或拆分独立剩余工作。
+- Worker 持有未提交唯一成果时，先形成安全 checkpoint 或完成成果回收，再创建替代写入 Worker。
+- 一次有界重规划后仍无有效进展，健康度改为 `STALLED`，生命周期进入 `BLOCKED`；保护成果后最多创建 1 个替代 Worker。
+- 恢复时 `controllerSeq` 必须从 `lastControllerSeq` 继续，重复或旧命令不得再次执行。
 
 ## 13. Skill 文件结构
 
@@ -1309,6 +1394,36 @@ https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/or
 - 用户自行点击归档，或另行明确要求 Codex 归档精确目标时，可以直接归档。
 - 归档不会被当作删除分支、worktree 或文件的授权。
 
+### 场景 20：派发前发现 Worker 过重
+
+- 一个候选 Worker 同时跨越三个顶层子系统、多个独立验收目标，并承担实现、规格、TDD 和全量回归。
+- 主控触发重量审查，优先拆成带依赖关系的多个 Worker。
+- 强依赖导致不可拆时，Prompt 记录 2–5 个里程碑、不可拆原因、首个健康检查点和预计最慢命令。
+
+### 场景 21：一对一长尾与逐步微授权
+
+- 运行只剩一个活跃 Worker，队列为空，连续约 15 分钟仍有可拆分剩余工作。
+- 主控发送 `CHECKPOINT`，发现 4 个已核对且互斥的测试批次。
+- 主控发送一次 `REPLAN`，批量授权完整 manifest 并要求首个 nonzero/timeout 即停，不再逐批等待批准。
+
+### 场景 22：消息活跃但没有有效进展
+
+- Worker 连续 3 条 `PROGRESS` 没有关闭验收项，且新增原计划之外的验收族。
+- 健康度改为 `AT_RISK`，主控进入 `重规划`，要求 checkpoint。
+- 新验收族属于原范围时拆分或收窄；超出原范围时请求用户授权，不能让原 Worker 静默吸收。
+
+### 场景 23：脏 worktree 不安全拆分
+
+- 过重 Worker 持有唯一未提交成果。
+- 主控不得直接创建第二个写入 Worker 接管同一文件边界。
+- 先按原请求授权完成 checkpoint、Handoff、commit 或替代持久化；稳定基线形成后才拆分，或只并发互不重叠的只读工作。
+
+### 场景 24：恢复后主控命令去重
+
+- 上下文压缩后主控恢复 `lastControllerSeq=014`。
+- 下一条命令必须使用更大的序号；重复的 `controllerSeq=014` 被 Worker 确认但不重复执行。
+- 消息频繁不被推断为 `HEALTHY`，健康度从最近可复核成果和范围变化恢复。
+
 ## 16. 完成标准
 
 Skill 实现完成后，应满足：
@@ -1324,6 +1439,11 @@ Skill 实现完成后，应满足：
 - `✍️/🔍/⌛️/✅/🗑️` 分别映射运行、验收、阻塞、成功终态和废弃终态；不使用 `📋` 表达交付物类型。
 - 每个阻塞都能进入主控并被用户看见。
 - 主控同时使用 Worker 消息和主动监控。
+- 每个 Worker 有 2–5 个可观察里程碑，并在 `PROGRESS` 中区分有效验收关闭与普通活动。
+- 主控对过重、冗余、范围膨胀、一对一长尾和 timeout 执行软触发健康检查；时间本身不自动停止 Worker。
+- `CHECKPOINT/REPLAN` 只调整原授权内的执行形状，不降低验收或扩大权限。
+- 写入型 Worker 的唯一未提交成果在另一个写入者接管前得到保护。
+- `controllerSeq` 严格递增，恢复后重复命令不重复执行。
 - Worker 的 `DONE` 必须先进入 `REVIEW` 和 `🔍`，再经过主控验收。
 - 写代码 Worker 默认位于独立 worktree，并具备明确文件所有权。
 - worktree 成果经过串行 Handoff、Local 组合验证和归档就绪门后才标记 `✅`。
@@ -1354,6 +1474,13 @@ Skill 实现完成后，应满足：
 | 成果回收 | 验收后串行 Handoff，随后运行 Local 组合验证 |
 | `wait_threads` 等待窗口 | 约 30 秒 |
 | 用户进度心跳 | 最长约 60 秒 |
+| Worker 可观察里程碑 | 2–5 个 |
+| 无验收关闭效率审查 | 约 30 分钟；合法长命令窗口除外 |
+| 一对一长尾效率审查 | `activeCount=1`、`queuedCount=0` 且仍可拆分时约 15 分钟 |
+| 无里程碑关闭 PROGRESS | 连续 3 条触发审查 |
+| 可预见逐步放行往返 | 3 次触发审查 |
+| 长命令偏离 | 超过已声明预计墙钟约 2 倍触发审查，不自动停止 |
+| 调度健康度 | `HEALTHY/AT_RISK/STALLED`，与生命周期正交 |
 | Worker 自动重建 | 同一失败最多 1 次 |
 | Worker 验收中标识 | Worker `DONE` 后、主控验收期间使用 `🔍` |
 | Worker 成功终态 | 归档就绪门通过后使用 `✅`，可以人工归档 |
@@ -1376,6 +1503,9 @@ Skill 实现完成后，应满足：
 7. `✅` 与 `🗑️` 都表示任务已完成归档就绪审计、可以人工归档，但永不自动归档。
 8. 无合入物不使用独立图标；报告、审计、设计或候选包通过原范围验收后同样使用 `✅`。
 9. 英文请求使用英文协调，中文请求使用中文协调；交付物语言与协调语言独立。
+10. 主控必须判断 Worker 是否过重、冗余、范围膨胀或陷入低效长尾，并通过 `CHECKPOINT/REPLAN` 在原授权内优化。
+11. 时间阈值只触发健康审查，不能自动停止、废弃或替代 Worker。
+12. 健康度不新增生命周期图标；效率审查使用标题后缀，真正等待重规划时使用 `⌛️`。
 
 当前没有阻塞第一版建设的待确认项。运行时出现的基线选择、远程项目歧义、额外权限或成果回收冲突，均由 Skill 的预检和 `BLOCKED` 协议处理，不需要在设计阶段预先猜测。
 
@@ -1386,10 +1516,10 @@ Skill 实现完成后，应满足：
 1. 使用官方 `skill-creator` 的初始化脚本，在仓库内创建 `.agents/skills/orchestrate-codex-tasks/`。
 2. 编写精简的 `SKILL.md`：
    - frontmatter 只包含 `name` 和严格触发范围的 `description`；
-   - 正文保留预检、六阶段调度、8 并发默认值、worktree 优先、本地优先、阻塞汇报、终态归档就绪门和禁止自动归档等核心规则；
+   - 正文保留预检、六阶段调度、8 并发默认值、任务重量审查、健康检查与重规划、worktree 优先、本地优先、阻塞汇报、终态归档就绪门和禁止自动归档等核心规则；
    - 正文控制在 500 行以内。
 3. 将详细工具契约、Handoff、远程主机和异常恢复放入 `references/tool-contracts.md`。
-4. 将双向消息格式、双语标题状态机、语言切换和恢复规则放入 `references/protocol.md`。
+4. 将双向消息格式、双语标题状态机、健康度、`CHECKPOINT/REPLAN`、语言切换和恢复规则放入 `references/protocol.md`。
 5. 将完整 Worker Prompt 分别放入 `references/worker-prompt.en.md` 和 `references/worker-prompt.zh-CN.md`，运行时只读取匹配 `runLanguage` 的一份。
 6. 依据最终 Skill 内容生成 `agents/openai.yaml`，启用严格描述驱动的隐式选择。
 7. 运行官方 `quick_validate.py`。
@@ -1401,6 +1531,8 @@ Skill 实现完成后，应满足：
    - 写代码默认环境必须为 `worktree`；
    - 每个 Worker Prompt 必须要求回传主控并包含主控 `threadId`。
    - 英文和中文 Worker Prompt 必须包含相同的协议枚举、安全边界和消息字段。
+   - `controllerSeq` 必须严格递增，重复或旧命令不得重复执行。
+   - 时间阈值只触发效率审查，不得出现按时长自动终止 Worker 的规则。
    - README.md 与 README.zh-CN.md 必须互相链接。
 9. 对第 15 节场景做无副作用的结构化演练。
 10. 只有用户明确要求进行真实端到端测试时，才实际创建独立 Worker 任务；测试完成后按结果标记 `✅` 或 `🗑️`，不自动归档。

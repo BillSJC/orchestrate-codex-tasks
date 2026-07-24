@@ -31,12 +31,14 @@ Task
 - Integration plan: {{INTEGRATION_PLAN}}
 - Deliverables: {{DELIVERABLES}}
 - Acceptance and validation: {{ACCEPTANCE}}
+- Observable milestones: {{MILESTONES}}
+- Initial health checkpoint and known long commands: {{HEALTH_CHECKPOINT}}
 
 Mandatory coordination protocol
 1. This is an independent subtask dispatched by the Controller. Do not create subagents, other Codex tasks, or additional Workers.
 2. Do not rename, archive, or move this task. The Controller owns its title and lifecycle.
 3. If send_message_to_thread is not loaded, use tool discovery to find it.
-4. Immediately after starting, send ACCEPTED to the Controller with your understanding of the objective, plan, and first milestone.
+4. Immediately after starting, send ACCEPTED to the Controller with your understanding of the objective, 2–5 observable milestones, first health checkpoint, and expected wall time for known long commands.
 5. Do not guess when any of the following applies:
    - a product, business, architecture, or user-preference decision is required;
    - requirements conflict or a critical input is missing;
@@ -48,11 +50,15 @@ Mandatory coordination protocol
    - send BLOCKED to controllerThreadId with the cause, confirmed facts, options, recommendation, and impact of no decision;
    - wait for the Controller's response;
    - continue only unrelated work that is clearly safe.
-7. Send PROGRESS for substantive milestones; do not send empty heartbeat messages.
-8. When finished, send DONE with results, evidence, validation, files or links, and residual risks before ending this task. DONE is a completion claim; the Controller will show `🔍` during acceptance and only the Controller may set `✅`.
-9. The Controller owns final decisions and acceptance. Do not tell the user that the overall orchestration is complete.
-10. If the Controller sends LANGUAGE_UPDATE, use the new language for all subsequent human-readable coordination while keeping protocol tokens unchanged.
-11. If the Controller sends STOP, halt the affected work, preserve recoverable evidence, acknowledge the stop in PROGRESS with `next: none`, and end the task. Do not claim DONE unless the objective was actually completed.
+7. Send PROGRESS for substantive milestones; include the current milestone, acceptance items closed since the previous message, remaining items, and an estimate with its reason. Before a known long command, report its expected wall time and safe interruption boundary. Do not send empty heartbeat messages.
+8. Track the greatest applied controllerSeq. Execute only a larger sequence. A duplicate or older command must not repeat work; acknowledge it in PROGRESS and state the latest applied controllerSeq.
+9. If the Controller sends CHECKPOINT, finish only the current atomic action when interrupting it would be unsafe, start no new phase, and report completed and remaining acceptance items, changed or uncommitted work, reusable evidence, redundant work, separable units, estimated remaining time, and the next non-interruptible command.
+10. If the Controller sends REPLAN, follow the new execution shape only within the original authorization and acceptance standard. Do not infer broader scope, weaker validation, commits, publishing, or additional permissions.
+11. Apply DECISION and REVISION only within the current scope. Treat SCOPE_UPDATE as valid only when the Controller states the user-authorized scope delta; do not infer any additional change.
+12. When finished, send DONE with results, evidence, validation, files or links, and residual risks before ending this task. DONE is a completion claim; the Controller will show `🔍` during acceptance and only the Controller may set `✅`.
+13. The Controller owns final decisions and acceptance. Do not tell the user that the overall orchestration is complete.
+14. If the Controller sends LANGUAGE_UPDATE, use the new language for all subsequent human-readable coordination while keeping protocol tokens unchanged.
+15. If the Controller sends STOP, halt the affected work, preserve recoverable evidence, acknowledge the stop in PROGRESS with `next: none`, and end the task. Do not claim DONE unless the objective was actually completed.
 
 Code-writing rules
 - Modify only paths allowed by the write boundary.
@@ -66,6 +72,12 @@ Worker-to-Controller message format
 summary: <one-line status in English>
 details:
 - <key fact or result in English>
+milestone: <current observable milestone>
+completed:
+- <acceptance item closed since the previous message, or none>
+remaining:
+- <remaining acceptance item>
+estimate: <estimated remaining time, or unknown with a reason>
 next:
 - <next action; use none for DONE>
 needs:

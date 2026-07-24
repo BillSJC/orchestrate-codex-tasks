@@ -1,6 +1,6 @@
 ---
 name: orchestrate-codex-tasks
-description: Coordinate the current Codex task as a Controller with multiple independent Codex Worker tasks/threads through task creation, cross-task messages, status-title updates, monitoring, worktree isolation, and result synthesis. Run all visible coordination in English or Chinese to match the user's orchestration request. Use only when the user explicitly invokes this skill to execute work or clearly asks for separate, independent, or background Codex tasks, a Controller + Worker workflow, cross-task coordination, “主控 + Worker”, “独立任务并发”, or “跨任务并发”. Do not use for Codex subagents, generic requests to work faster, vague parallelism, shell/program concurrency, simple tightly coupled work, or requests that do not authorize creating new Codex tasks.
+description: Coordinate the current Codex task as a Controller with multiple independent Codex Worker tasks/threads through task creation, cross-task messages, status-title updates, health checks, adaptive replanning, worktree isolation, and result synthesis. Run all visible coordination in English or Chinese to match the user's orchestration request. Use only when the user explicitly invokes this skill to execute work or clearly asks for separate, independent, or background Codex tasks, a Controller + Worker workflow, cross-task coordination, “主控 + Worker”, “独立任务并发”, or “跨任务并发”. Do not use for Codex subagents, generic requests to work faster, vague parallelism, shell/program concurrency, simple tightly coupled work, or requests that do not authorize creating new Codex tasks.
 ---
 
 # Orchestrate Codex Tasks
@@ -68,9 +68,10 @@ description: Coordinate the current Codex task as a Controller with multiple ind
    - 默认 `maxActiveWorkers = 8`。
    - 接受用户明确给出的正整数覆盖值。
    - 并发值只是上限；不要为了填满槽位制造低价值 Worker。
-6. 把工作拆成轻量 DAG。每个 Worker 必须具备单一目标、明确输入、独立验收条件、文件所有权和已知依赖。
-7. 把高度耦合实现、共享接口定稿、用户偏好、风险接受和最终整合留给主控。
-8. 使用项目列表选择执行位置：
+6. 把工作拆成轻量 DAG。每个 Worker 必须具备单一目标、明确输入、2–5 个可观察里程碑、独立验收条件、文件所有权和已知依赖。
+7. 派发前进行任务重量审查。跨越多个顶层子系统、包含多个可独立验收目标、同时承担实现/规格/TDD/完整回归，或存在大量未知前置时，优先继续拆分；确实不可拆时，记录原因、首个健康检查点和预计最慢合法命令。
+8. 把高度耦合实现、共享接口定稿、用户偏好、风险接受和最终整合留给主控。
+9. 使用项目列表选择执行位置：
    - 用户明确指定的主机优先于默认策略；
    - 否则优先本地同项目；
    - 仅在本地缺少必要项目、依赖或能力时选择明确匹配的远程项目。
@@ -97,6 +98,7 @@ description: Coordinate the current Codex task as a Controller with multiple ind
    - 目标、范围、输入、禁止事项；
    - 主机、环境和 worktree 起始状态；
    - 文件写入边界、成果回收方式和验收命令。
+   - 2–5 个可观察里程碑、首个健康检查点和已知长命令的预期墙钟时间。
 3. 创建独立任务；除非用户明确指定，否则不覆盖 Worker 的模型或 reasoning 配置。
 4. 记录返回的 `threadId` 或 `clientThreadId`、`hostId`、环境和状态。
 5. 获得真实 `threadId` 后，立即使用匹配 `runLanguage` 的 `RUNNING` Worker 标题模板改名。
@@ -120,10 +122,38 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 - 派发、阻塞、验收完成、重试、范围变化和替换发生时立即向用户汇报。
 - 没有状态变化时，最长约每 60 秒发送一次有信息量的简短心跳。
 - 不把 Worker 的自称完成直接视为验收通过。
+- 不把消息频繁等同于有效进展。每次 `PROGRESS` 更新当前里程碑、已经关闭和剩余的验收项、预计剩余时间，以及正在运行的已声明长命令。
 
 把 `PROVISIONING`、`RUNNING`、`BLOCKED` 和 `REVIEW` 都计入活跃数。`ACCEPTED` 或 `RETIRED` 才释放槽位。
 
-## 6. 处理阻塞
+## 6. 效率审查与重规划
+
+健康度与生命周期正交，账本使用 `HEALTHY/AT_RISK/STALLED`；不要增加新的生命周期图标。时间阈值只触发审查，不自动停止 Worker。
+
+出现以下任一软触发条件时立即进行效率审查：
+
+- 连续约 30 分钟没有关闭验收项，且不处于已声明的合法长命令窗口；长命令超过预期约 2 倍或已无可观察执行迹象时也触发。
+- 连续 3 条 `PROGRESS` 没有关闭里程碑，或出现 3 次可预见的“主控放行一步、Worker 执行一步”往返。
+- 新增原计划之外的验收族、顶层子系统、写入边界或未知架构工作。
+- 出现 timeout、重复诊断、上下文压缩、消息序号重复或同一失败路径反复尝试。
+- `activeCount=1` 且 `queuedCount=0` 持续约 15 分钟，而剩余工作仍包含可独立执行单元。
+
+审查流程：
+
+1. 将 Worker 健康度记为 `AT_RISK`，主控使用 protocol reference 的 `REPLANNING` 标题；Worker 继续执行时保留 `✍️` 并加“效率审查”后缀，暂停等待重规划时使用 `⌛️`。
+2. 发送 `CHECKPOINT`，要求 Worker 在安全边界暂停新阶段并回报：已完成/剩余验收项、当前里程碑、文件与未提交成果、重复或冗余工作、可拆分单元、预计剩余时间和下一条不可中断命令。
+3. 主控在原始授权内选择并记录一种处理：
+   - 继续当前计划，但给出理由、下一个可验证里程碑和复查时间；
+   - 发送 `REPLAN`，一次性授权已经核对的有界 manifest，采用首个 nonzero/timeout 即停，避免逐步微授权；
+   - 删除被更强证据覆盖的重复执行，不能降低原验收标准；
+   - 将独立剩余工作拆给新 Worker，并收窄原 Worker；新发现且不属于原范围的工作必须请求用户授权；
+   - 一次有界重规划后仍无有效进展时，保护并回收成果，再按终止与取代流程替换 Worker。
+4. 写入型 Worker 有未提交唯一成果时，不得创建第二个写入者接管同一边界。先完成用户已授权的 checkpoint、Handoff 或其他持久化，再从稳定基线拆分。
+5. 向用户报告触发原因、已完成成果、处理决定、并发变化、下一检查点和残余风险。
+
+`CHECKPOINT/REPLAN` 只能调整原范围内的执行形状，不得扩大权限、放宽验收、自动提交或制造无意义并发。只有经过一次有界重规划后仍无法产生有效进展，或确实等待外部决定时，才把健康度记为 `STALLED` 并进入 `BLOCKED`。
+
+## 7. 处理阻塞
 
 收到 `BLOCKED` 或发现等待用户/外部条件时：
 
@@ -137,7 +167,7 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
    - 暂停受影响路径，继续不相关且安全的工作。
 5. 不因阻塞自动扩大范围、权限或外部影响。
 
-## 7. 终止、废弃与取代
+## 8. 终止、废弃与取代
 
 用户取消任务、目标失去价值，或原 Worker 无法安全恢复且已决定使用替代 Worker 时：
 
@@ -152,7 +182,7 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 4. 立即向用户说明终止原因、替代 Worker、成果处置和残余风险。
 5. `🗑️` 表示逻辑终止且可人工归档，不代表自动归档、删除任务、删除分支或清理 worktree。
 
-## 8. 验收与代码回收
+## 9. 验收与代码回收
 
 收到 `DONE` 或观察到 Worker 结束后：
 
@@ -181,7 +211,7 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 
 “允许写代码”不自动授权 commit、push、PR 或发布。若 Handoff 不可用，先取得用户认可的持久化方式；不得让重要成果只存在于可能被产品清理的临时 worktree 而不告知用户。
 
-## 9. 完成运行
+## 10. 完成运行
 
 全部 Worker 已验收并完成总体组合验证后：
 
@@ -190,7 +220,7 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 3. 保留所有 `✅`、`🗑️`、`⌛️` 和主控任务。
 4. 不调用任何归档工具。`✅` 和 `🗑️` 明确表示用户可以直接人工归档；用户明确要求由 Codex 归档时，把它视为本次自动编排之外的独立、精确目标操作。
 
-## 10. 运行中调整并发
+## 11. 运行中调整并发
 
 - 升高上限：更新账本，从已规划的就绪队列补充派发，不重复或重新拆分运行中的任务。
 - 降低上限：停止新派发，让现有 Worker 自然完成；除非用户明确要求停止具体 Worker，否则不自动中断。
@@ -198,7 +228,7 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 - 无法满足用户值时：报告 `requested`、可执行 `effective` 和原因，不静默替换。
 - 每次调整都向用户报告旧值、新值、活跃数和排队数。
 
-## 11. 恢复运行
+## 12. 恢复运行
 
 主控上下文丢失或任务恢复时：
 
@@ -206,7 +236,7 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 2. 用任务列表重建 Worker 集合。
 3. 从运行账本恢复 `runLanguage`；账本不可用时，从主控标题和最近一条实质性用户请求恢复。
 4. 用任务读取工具恢复近期状态和证据。
-5. 按 `runId + workerId + seq` 去重消息。
+5. 按 `runId + workerId + seq` 去重 Worker 消息；恢复每个 Worker 的 `lastControllerSeq`，主控新命令必须继续严格递增。
 6. 不因恢复失败创建重复 Worker。
 
 始终把账本作为逻辑状态、标题作为用户可见投影。标题更新失败时有限重试并报告，但不要丢弃 Worker 成果或违反禁止归档规则。

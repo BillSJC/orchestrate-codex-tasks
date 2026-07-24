@@ -6,7 +6,46 @@
 
 > Workers are independent Codex tasks, not Codex subagents.
 
-## 1. Installation
+## 1. What You Will See
+
+After dispatch, the Codex task list forms a visible Controller and Worker group:
+
+```text
+👑 [R7K2] Tracking 5 Workers | Prepare the release
+├── ✍️ [R7K2-W1] Implement the release script
+├── 🔍 [R7K2-W2] Verify update instructions | Awaiting Controller acceptance
+├── ⌛️ [R7K2-W3] Test deployment | Waiting for a target environment
+├── ✅ [R7K2-W4] Review safety boundaries | Accepted, no integration artifact
+└── 🗑️ [R7K2-W5] Review the old candidate | Superseded by W6
+```
+
+| Marker | Meaning |
+|---|---|
+| `👑` | The current task is the single Controller responsible for decisions, monitoring, acceptance, and synthesis |
+| `✍️` | The Worker is running or revising |
+| `🔍` | The Worker reported `DONE`; the Controller is validating or integrating the result |
+| `⌛️` | The Worker is blocked by a decision, clarification, permission, dependency, or failure |
+| `✅` | The Worker completed its Prompt scope, passed the archive-readiness gate, and is safe to archive manually |
+| `🗑️` | The Worker was cancelled, retired, invalidated, or superseded, passed the archive-readiness gate, and is safe to archive manually |
+
+Markers describe lifecycle, not deliverable type. A validated report, audit, design, DAG, or candidate package can receive `✅` even when it has no code or merge artifact. The Skill does not use `📋` as a state.
+
+You can expect:
+
+- An immediate dispatch report with Worker names, objectives, active and queued counts, concurrency limit, and execution location.
+- Worker messages when a task is accepted, reaches a substantive milestone, becomes blocked, or finishes.
+- Active monitoring by the Controller and timely reports of meaningful changes.
+- A paused affected Worker plus facts, options, and a recommendation when user input is required.
+- Health checks that distinguish useful milestone closure from frequent messages, then request a safe checkpoint when a Worker becomes too broad, repetitive, or slow.
+- Adaptive replanning that can batch-authorize a reviewed test manifest, remove redundant execution, or split independent remaining work without weakening acceptance.
+- `🔍` after a Worker reports `DONE`; `✅` appears only after independent Controller acceptance and result recovery.
+- `🗑️` only after useful results are recovered or intentionally rejected and any replacement Worker is recorded.
+- Isolated worktrees for code-writing Workers by default, reducing concurrent-edit conflicts.
+- `✅` and `🗑️` tasks that remain visible and are never automatically archived; either marker means the user may archive the task manually.
+
+Health is separate from lifecycle markers. During an efficiency review, the Controller may use `👑 [R7K2] Replanning | ...`; a Worker stays `✍️ ... | Efficiency review` while progressing or becomes `⌛️ ... | Waiting for replanning` when paused. Time thresholds trigger review only—they never automatically stop or retire a Worker.
+
+## 2. Installation and Updates
 
 ### Recommended: let Codex install the Skill
 
@@ -64,41 +103,6 @@ Do not create any Workers.
 ```
 
 Do not leave a backup containing the same `SKILL.md` inside `.agents/skills`, `$HOME/.agents/skills`, or `$CODEX_HOME/skills`. Codex does not merge Skills with the same `name`; duplicate copies can expose different versions. After validating the update in a new task, remove the external backup only when you no longer need rollback.
-
-## 2. What You Will See
-
-After dispatch, the Codex task list forms a visible Controller and Worker group:
-
-```text
-👑 [R7K2] Tracking 5 Workers | Prepare the release
-├── ✍️ [R7K2-W1] Implement the release script
-├── 🔍 [R7K2-W2] Verify update instructions | Awaiting Controller acceptance
-├── ⌛️ [R7K2-W3] Test deployment | Waiting for a target environment
-├── ✅ [R7K2-W4] Review safety boundaries | Accepted, no integration artifact
-└── 🗑️ [R7K2-W5] Review the old candidate | Superseded by W6
-```
-
-| Marker | Meaning |
-|---|---|
-| `👑` | The current task is the single Controller responsible for decisions, monitoring, acceptance, and synthesis |
-| `✍️` | The Worker is running or revising |
-| `🔍` | The Worker reported `DONE`; the Controller is validating or integrating the result |
-| `⌛️` | The Worker is blocked by a decision, clarification, permission, dependency, or failure |
-| `✅` | The Worker completed its Prompt scope, passed the archive-readiness gate, and is safe to archive manually |
-| `🗑️` | The Worker was cancelled, retired, invalidated, or superseded, passed the archive-readiness gate, and is safe to archive manually |
-
-Markers describe lifecycle, not deliverable type. A validated report, audit, design, DAG, or candidate package can receive `✅` even when it has no code or merge artifact. The Skill does not use `📋` as a state.
-
-You can expect:
-
-- An immediate dispatch report with Worker names, objectives, active and queued counts, concurrency limit, and execution location.
-- Worker messages when a task is accepted, reaches a substantive milestone, becomes blocked, or finishes.
-- Active monitoring by the Controller and timely reports of meaningful changes.
-- A paused affected Worker plus facts, options, and a recommendation when user input is required.
-- `🔍` after a Worker reports `DONE`; `✅` appears only after independent Controller acceptance and result recovery.
-- `🗑️` only after useful results are recovered or intentionally rejected and any replacement Worker is recorded.
-- Isolated worktrees for code-writing Workers by default, reducing concurrent-edit conflicts.
-- `✅` and `🗑️` tasks that remain visible and are never automatically archived; either marker means the user may archive the task manually.
 
 ## 3. When and How to Use It
 
@@ -182,6 +186,8 @@ flowchart TD
     W1 -->|"ACCEPTED / PROGRESS / DONE"| C
     W2 -->|"BLOCKED"| C
     W3 -->|"ACCEPTED / PROGRESS / DONE"| C
+    W1 -->|"Milestones stop closing"| H["Controller health review"]
+    H -->|"CHECKPOINT / REPLAN"| W1
     C -->|"User decision required"| U
     C --> V["🔍 Controller acceptance and integration"]
     C -->|"STOP / supersede"| X["🗑️ Retired Worker"]
@@ -194,9 +200,10 @@ The core workflow is:
 2. **Language and addressing:** The Controller selects `runLanguage`, generates a run ID, and resolves its own `threadId`; cross-host runs also record `hostId`.
 3. **Decomposition and dispatch:** The Controller builds dependency-aware subtasks, selects the matching Worker Prompt language, and injects scope, prohibitions, file boundaries, and acceptance criteria.
 4. **Two-way coordination:** Workers send `ACCEPTED`, `PROGRESS`, `BLOCKED`, and `DONE`; the Controller also observes tasks through wait and read capabilities.
-5. **Blocker decisions:** Workers pause instead of guessing about product, architecture, permission, or risk decisions and send options back to the Controller.
-6. **Acceptance and integration:** The Controller checks deliverables and validation evidence. Code results are handed back in dependency order and validated together.
-7. **Terminal state without automatic archiving:** Accepted Workers receive `✅`; cancelled or superseded Workers receive `🗑️`. Both are safe for manual archiving after the archive-readiness gate, but the Skill keeps them visible.
+5. **Health and replanning:** The Controller tracks closed acceptance items, scope growth, serial decision round trips, timeouts, and one-to-one tail work. Soft thresholds cause `CHECKPOINT`, then a bounded `REPLAN` when useful.
+6. **Blocker decisions:** Workers pause instead of guessing about product, architecture, permission, or risk decisions and send options back to the Controller.
+7. **Acceptance and integration:** The Controller checks deliverables and validation evidence. Code results are handed back in dependency order and validated together.
+8. **Terminal state without automatic archiving:** Accepted Workers receive `✅`; cancelled or superseded Workers receive `🗑️`. Both are safe for manual archiving after the archive-readiness gate, but the Skill keeps them visible.
 
 ## 5. Safety Boundaries and Defaults
 
@@ -211,6 +218,8 @@ The core workflow is:
 | Commits and publishing | Do not commit, push, open PRs, or publish unless the original request authorizes it |
 | Permissions | Do not bypass approvals, sandboxes, credentials, or external-write restrictions |
 | Worker expansion | Workers may not create subagents, other tasks, or additional Workers |
+| Efficiency review | Soft thresholds request a safe checkpoint; they do not automatically stop a Worker or weaken validation |
+| Replanning | May batch safe steps or split independent work within the original authorization; a dirty worktree must be checkpointed before another writer takes over |
 | Completion | A Worker `DONE` message enters `🔍`; Controller acceptance and result recovery are required for `✅` |
 | Retirement | Cancelled or superseded work receives `🗑️` only after useful-result disposition and replacement tracking |
 | Automatic archiving | Prohibited; `✅` and `🗑️` are terminal, manually archive-ready states |

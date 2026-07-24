@@ -199,6 +199,15 @@ read_thread({
 3. 更新所有 cursor。
 4. 保证每个活跃 Worker 至少每 60 秒被主动观察一次。
 
+### 5.2 效率检查
+
+`wait_threads` 快照只能证明任务存活或需要注意，不能证明有效进展。健康软阈值触发时：
+
+1. 使用账本中的 `lastUsefulProgressAt`、里程碑、验收关闭数和长命令窗口判断，不能用 commentary 数量代替。
+2. 对目标 Worker 执行一次紧凑 `read_thread`，默认 `turnLimit: 5`、`includeOutputs: false`；只有核验证据需要时才有限读取输出。
+3. 使用 `send_message_to_thread` 发送 protocol reference 定义的 `CHECKPOINT`，取得安全边界快照后再决定是否 `REPLAN`。
+4. 不通过提高轮询频率、重复读取大输出或持续发送催促消息制造“看起来很忙”的状态。
+
 ## 6. worktree 与起始状态
 
 worktree 只适用于 Git 仓库。它为每个 Worker 提供独立 checkout，适合多个写代码任务并行。
@@ -264,6 +273,8 @@ get_handoff_status({
 
 Codex 托管 worktree 可能受产品级保留和清理策略影响。“不自动归档”只约束本 Skill 的归档行为，不保证底层 worktree 永久存在。标记 `✅` 或 `🗑️` 前，确保需要保留的代码已 Handoff、已用用户认可方式持久化，或已明确记录不再采用；不能让仍需恢复的唯一成果滞留在临时 worktree。
 
+效率重规划不能绕过成果回收：写入型 Worker 持有未提交唯一成果时，不得直接创建第二个写入 Worker 接管同一文件边界。先让原 Worker 到达安全 checkpoint，并使用原请求已授权的 Handoff、commit 或替代持久化方式形成稳定基线；只读分析和互不重叠的工作仍可独立拆分。
+
 ## 8. 本地和远程主机
 
 `list_projects` 返回本地与已连接远程主机上的项目。使用返回的 `projectId` 创建任务，不构造 `hostId`。
@@ -317,6 +328,14 @@ handoff_thread({
 - 用最后有效 `hostId` 做一次有限核对。
 - 只读工作可以在授权范围内创建 1 个本地替代 Worker。
 - 未同步的远程写入成果不能标记 `✅`。
+
+### 9.5 Worker 低效或陷入长尾
+
+- 时间阈值只触发 `CHECKPOINT`，不直接终止任务。
+- 一次紧凑读取后，按 protocol reference 检查验收关闭、范围增长、逐步放行往返、timeout 和可拆分工作。
+- 可在原始授权内批量放行已核对的有界 manifest，并使用首个 nonzero/timeout 即停。
+- 一次有界 `REPLAN` 后仍无有效进展时进入 `STALLED/BLOCKED`；保护并回收成果后，最多创建 1 个替代 Worker。
+- 不因 Worker 较慢就复制相同任务，也不让两个 Worker 同时修改同一脏 worktree。
 
 ## 10. 官方依据
 
