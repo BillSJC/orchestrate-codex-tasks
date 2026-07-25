@@ -28,6 +28,7 @@ Task
 - Acceptance: {{ACCEPTANCE}}
 - Milestones: {{MILESTONES}}
 - First checkpoint: {{HEALTH_CHECKPOINT}}
+- Failure policy: {{FAILURE_POLICY}}
 - Integration: {{INTEGRATION_PLAN}}
 
 Profile rules
@@ -37,7 +38,9 @@ Required protocol
 - Do not create subagents, other Codex tasks, or Workers; do not rename or archive this task.
 - Do not touch the Controller SQLite ledger or runtime state. The Controller is the sole ledger writer.
 - Send ACCEPTED once at startup. Send PROGRESS only for substantive milestones; no empty heartbeats.
-- Pause affected work and send BLOCKED with facts, options, and a recommendation when a decision, broader authority, boundary change, or high-risk action is needed.
+- Classify abnormal results before blocking: a contract-accepted exit/signature is `EXPECTED_RESULT`; quoting, path, parser, command-shape, wrapper, or proven no-partial-write patch errors are `RECOVERABLE_CONTROL`; title, cursor, wait, renderer, or message-transport failures are `CONTROL_DEGRADED`.
+- Correct `RECOVERABLE_CONTROL` locally within the failure policy after proving there is no unknown partial write, permission change, or scope expansion. Continue safe independent work during `CONTROL_DEGRADED`.
+- Send BLOCKED only for `WORK_BLOCKER`: a required decision, authority, dependency, boundary change, irreversible risk, timeout, unknown partial write, or exhausted correction budget.
 - Track the greatest controllerSeq and execute only a larger one. CHECKPOINT stops at a safe boundary, REPLAN stays within existing authority, and STOP preserves evidence then stops.
 - Send DONE with results, acceptance evidence, and residual risk. Do not claim the overall orchestration is complete.
 - Use English for coordination; keep protocol fields, IDs, paths, commands, and code unchanged.
@@ -51,6 +54,8 @@ completed:
 remaining:
 - <remaining item or none>
 estimate: <estimated remaining>
+incidentClass: <NONE|EXPECTED_RESULT|RECOVERABLE_CONTROL|CONTROL_DEGRADED|WORK_BLOCKER>
+localCorrectionAttempts: <used attempts or 0>
 next:
 - <next action or none>
 needs:
@@ -66,5 +71,5 @@ send_message_to_thread({
   "prompt": "<completed message>"
 })
 
-When controllerHostId is unnecessary on the same host, remove its line and the complete hostId field. If the tool is unavailable, start final output with BLOCKED and stop work that needs a Controller decision.
+When controllerHostId is unnecessary on the same host, remove its line and the complete hostId field. If the tool is unavailable, report `CONTROL_DEGRADED` in this task and continue safe work that needs no Controller decision. Pause only a path that truly needs a decision, and send one consolidated PROGRESS after the tool recovers.
 ```

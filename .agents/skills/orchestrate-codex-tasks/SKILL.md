@@ -105,6 +105,7 @@ description: Coordinate the current Codex task as a Controller with multiple ind
    - 主机、环境和 worktree 起始状态；
    - 文件写入边界、成果回收方式和验收命令。
    - 2–5 个可观察里程碑、首个健康检查点和已知长命令的预期墙钟时间。
+   - 失败分类策略和本地纠错预算。默认允许对已经证明无部分写入、无边界变化、无权限扩张的控制/命令输入错误本地纠正一次。
 4. 用渲染结果的最小化 request 写 `CREATE_THREAD` intent；之后调用实际创建工具，再用清理后的稳定 ID 写 outcome。除非用户明确指定，否则不覆盖 Worker 的模型或 reasoning 配置。
 5. 记录返回的 `threadId` 或 `clientThreadId`、`hostId`、环境和状态。工具超时或结果含糊时保留 pending/unknown，先核对外部事实，不重复创建。
 6. 获得真实 `threadId` 后，按相同 intent/tool/outcome 顺序设置渲染好的 `RUNNING` 标题。
@@ -122,16 +123,16 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 
 规则：
 
-- 默认最多 8 个活跃 Worker，放入一个最多 8 目标的等待集合。
+- 默认最多 8 个活跃 Worker。持续等待集合只放 `PROVISIONING/RUNNING`；`BLOCKED/REVIEW` 仍计入活跃槽位，但按事件或验收需要读取，避免静止任务制造轮询压力。
 - 用户把并发调到 8 以上时，按稳定顺序分成每组最多 8 个目标；每轮先对所有组取即时增量快照，再对一个轮转组做不超过约 15 秒的等待。
-- `PROVISIONING/RUNNING` Worker 最迟每 60 秒主动观察一次；`REVIEW` 最迟每 2 分钟一次；`BLOCKED` 以事件驱动为主，最长每 5 分钟复核一次。内部观察不等于用户可见消息。
+- `PROVISIONING/RUNNING` Worker 最迟每 60 秒主动观察一次；`REVIEW` 在验收动作发生时读取；`BLOCKED` 只在收到决定、外部条件变化或用户要求时复核。内部观察不等于用户可见消息，正常等待 timeout 也不是控制系统阻塞。
 - 派发、阻塞、验收完成、重试、范围变化和替换发生时立即向用户汇报。
 - 没有状态变化时，不为每轮观察发送消息；只有运行仍需要用户关注时，最长约每 10 分钟发送一次有信息量的摘要。
-- 同一任务服务连续 2 次 timeout 或无响应后，停止切换 `list/read/wait` 变体探测 2 分钟，保存当前 cursor 并使用账本与本地证据；冷却后只做一次探测。timeout 不是 Worker 消失的证据，不得据此重复创建或终结 Worker。
+- 任务服务返回临时不可用、限流或传输错误时，保持 Worker 状态并按 5/15/30/60 秒上限退避；连续 2 次 timeout 或无响应后停止切换 `list/read/wait` 变体探测 2 分钟。只有状态确实含糊时做一次任务列表或紧凑读取核对，不并发重试、不改标题。timeout 不是 Worker 消失或工作阻塞的证据。
 - 不把 Worker 的自称完成直接视为验收通过。
 - 不把消息频繁等同于有效进展。每次 `PROGRESS` 更新当前里程碑、已经关闭和剩余的验收项、预计剩余时间，以及正在运行的已声明长命令。
 - 每条可接受的 Worker 消息先以 `WORKER_MESSAGE_APPLIED` 落账，再执行标题、回复、Handoff 或下一波派发。旧 `seq` 只确认忽略，不重复状态变化。
-- 每次等待快照后保存 cursor。跨任务消息先由账本分配 `controllerSeq`，再用 dispatch script 渲染，按 intent/tool/outcome 发送。
+- 只有 cursor 确实变化时才保存。跨任务消息先由账本分配 `controllerSeq`，再用 dispatch script 渲染，按 intent/tool/outcome 发送。
 
 把 `PROVISIONING`、`RUNNING`、`BLOCKED` 和 `REVIEW` 都计入活跃数。`ACCEPTED` 或 `RETIRED` 才释放槽位。
 
@@ -153,7 +154,7 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 2. 发送 `CHECKPOINT`，要求 Worker 在安全边界暂停新阶段并回报：已完成/剩余验收项、当前里程碑、文件与未提交成果、重复或冗余工作、可拆分单元、预计剩余时间和下一条不可中断命令。
 3. 主控在原始授权内选择并记录一种处理；task 规格变化使用 `TASK_REPLANNED`，新 manifest 重新编译并激活：
    - 继续当前计划，但给出理由、下一个可验证里程碑和复查时间；
-   - 发送带 `executionPlan` 的 `REPLAN`，一次性授权已经核对的有界步骤；必须声明 `maxWallTimeMinutes`，并令 `stopOnFirstNonzero=true`、`stopOnTimeout=true`，避免逐步微授权；
+   - 发送带 `stepContracts` 的 `REPLAN`，一次性授权已经核对的有界步骤；每步声明 `acceptedExitCodes`、可选 `expectedFailureSignature`、`timeoutSeconds` 和 `partialWriteCheck`。无匹配搜索、签名正确的 TDD Red 等预期 nonzero 不停止；只有契约外失败、timeout 或未知部分写入才停止。历史 pending `executionPlan` 仅用于恢复兼容，不再生成；
    - 删除被更强证据覆盖的重复执行，不能降低原验收标准；
    - 将独立剩余工作拆给新 Worker，并收窄原 Worker；新发现且不属于原范围的工作必须请求用户授权；
    - 一次有界重规划后仍无有效进展时，保护并回收成果，再按终止与取代流程替换 Worker。
@@ -166,15 +167,21 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 
 收到 `BLOCKED` 或发现等待用户/外部条件时：
 
-1. 先落账状态和阻塞证据，再使用 dispatch script 渲染匹配 `runLanguage` 的 `BLOCKED` 标题，按 intent/tool/outcome 改名。
-
-2. 判断是否能在原始授权内安全决定。
-3. 能决定时，记录决定；先写消息 intent 取得 `controllerSeq`，再渲染并发送 `DECISION`，Worker 恢复后改回 `✍️`。
-4. 需要用户决定时：
+1. 先按 Worker 证据分类：步骤契约接受的结果是 `EXPECTED_RESULT`；引号、路径、参数、解析器、命令形状、已知 wrapper 或已证明无部分写入的 patch 错误是 `RECOVERABLE_CONTROL`；标题、cursor、wait、renderer、临时 JSON 或消息传输失败是 `CONTROL_DEGRADED`；只有需要决定/权限/依赖/边界变化、存在不可逆风险、timeout、未知部分写入或纠错预算耗尽才是 `WORK_BLOCKER`。
+2. Worker 把前三类误报为 `BLOCKED` 时，保留原始消息用于审计，但以 `blockerDisposition=RECOVERABLE` 落账并保持 `RUNNING`；只有 `WORK_BLOCKER` 使用 `blockerDisposition=BLOCK`、进入生命周期 `BLOCKED` 并改为 `⌛️`。
+3. 对真实工作阻塞，先落账状态和证据，再使用 dispatch script 渲染匹配 `runLanguage` 的 `BLOCKED` 标题，按 intent/tool/outcome 改名。
+4. 判断是否能在原始授权内安全决定。能决定时，记录决定；先写消息 intent 取得 `controllerSeq`，再渲染并发送 `DECISION`，Worker 恢复后改回 `✍️`。
+5. 需要用户决定时：
    - 使用 dispatch script 渲染匹配 `runLanguage` 的 `WAITING_FOR_USER` 标题并按外部操作流程更新；
    - 立即用 `runLanguage` 报告事实、选项、建议和不决策的影响；
    - 暂停受影响路径，继续不相关且安全的工作。
-5. 不因阻塞自动扩大范围、权限或外部影响。
+6. 不因阻塞自动扩大范围、权限或外部影响。
+
+### 7.1 控制面故障不得冒充工作阻塞
+
+- 标题、cursor、等待快照、renderer 输入、临时 JSON、命令引号或任务消息传输属于控制面；它们失败时保留 Worker 的真实生命周期。
+- 对确认无外部副作用的控制错误，在本地纠错预算内修正一次；任务服务短暂失败按退避规则处理。未恢复时标记运行 `DEGRADED`，继续不依赖新决定的安全工作，不把 Worker 改成 `BLOCKED`。
+- 账本持久化失败时停止新的外部副作用并进入运行级 `DEGRADED` 恢复；它是控制系统故障，不是 Worker 工作阻塞。
 
 ## 8. 终止、废弃与取代
 

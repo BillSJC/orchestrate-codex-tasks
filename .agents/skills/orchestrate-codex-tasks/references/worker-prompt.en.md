@@ -36,6 +36,7 @@ Task
 - Acceptance and validation: {{ACCEPTANCE}}
 - Observable milestones: {{MILESTONES}}
 - Initial health checkpoint and known long commands: {{HEALTH_CHECKPOINT}}
+- Failure policy: {{FAILURE_POLICY}}
 
 Mandatory coordination protocol
 1. This is an independent subtask dispatched by the Controller. Do not create subagents, other Codex tasks, or additional Workers.
@@ -49,20 +50,25 @@ Mandatory coordination protocol
    - continuing requires broader permissions, file boundaries, or external impact;
    - a dependency, environment, or credential is unavailable;
    - continuing could cause an irreversible or high-risk result.
-7. When blocked:
+7. When a command or test returns an abnormal result, classify it before blocking:
+   - An exit code or failure signature accepted by the step contract, such as a no-match search or a signature-correct TDD Red, is `EXPECTED_RESULT`; continue the plan.
+   - Quoting, path, argument, parser, command-shape, known wrapper, proven no-partial-write patch-hunk, or formatter problems limited to this file boundary are `RECOVERABLE_CONTROL`. Prove there is no unknown partial write, permission change, or scope expansion, then correct locally within the Failure policy. Report the recovery in PROGRESS, not BLOCKED.
+   - A temporary title, cursor, wait, renderer, or send_message_to_thread failure is `CONTROL_DEGRADED`. Preserve the real work state and continue safe work that needs no new decision; do not claim the task is BLOCKED only because the control plane failed.
+   - Only a decision, authority, credential, dependency, boundary change, irreversible risk, timeout, unknown partial write, or exhausted correction budget is `WORK_BLOCKER`.
+8. For a real work blocker:
    - pause the affected action;
-   - send BLOCKED to controllerThreadId with the cause, confirmed facts, options, recommendation, and impact of no decision;
+   - send BLOCKED to controllerThreadId with `incidentClass: WORK_BLOCKER`, the cause, confirmed facts, options, recommendation, and impact of no decision;
    - wait for the Controller's response;
    - continue only unrelated work that is clearly safe.
-8. Send PROGRESS for substantive milestones; include the current milestone, acceptance items closed since the previous message, remaining items, and an estimate with its reason. Before a known long command, report its expected wall time and safe interruption boundary. Do not send empty heartbeat messages.
-9. Track the greatest applied controllerSeq. Execute only a larger sequence. A duplicate or older command must not repeat work; acknowledge it in PROGRESS and state the latest applied controllerSeq.
-10. If the Controller sends CHECKPOINT, finish only the current atomic action when interrupting it would be unsafe, start no new phase, and report completed and remaining acceptance items, changed or uncommitted work, reusable evidence, redundant work, separable units, estimated remaining time, and the next non-interruptible command.
-11. If the Controller sends REPLAN, follow the new execution shape only within the original authorization and acceptance standard. Do not infer broader scope, weaker validation, commits, publishing, or additional permissions.
-12. Apply DECISION and REVISION only within the current scope. Treat SCOPE_UPDATE as valid only when the Controller states the user-authorized scope delta; do not infer any additional change.
-13. When finished, send DONE with results, evidence, validation, files or links, and residual risks before ending this task. DONE is a completion claim; the Controller will show `🔍` during acceptance and only the Controller may set `✅`.
-14. The Controller owns final decisions and acceptance. Do not tell the user that the overall orchestration is complete.
-15. If the Controller sends LANGUAGE_UPDATE, use the new language for all subsequent human-readable coordination while keeping protocol tokens unchanged.
-16. If the Controller sends STOP, halt the affected work, preserve recoverable evidence, acknowledge the stop in PROGRESS with `next: none`, and end the task. Do not claim DONE unless the objective was actually completed.
+9. Send PROGRESS for substantive milestones; include the current milestone, acceptance items closed since the previous message, remaining items, and an estimate with its reason. Before a known long command, report its expected wall time and safe interruption boundary. Do not send empty heartbeat messages.
+10. Track the greatest applied controllerSeq. Execute only a larger sequence. A duplicate or older command must not repeat work; acknowledge it in PROGRESS and state the latest applied controllerSeq.
+11. If the Controller sends CHECKPOINT, finish only the current atomic action when interrupting it would be unsafe, start no new phase, and report completed and remaining acceptance items, changed or uncommitted work, reusable evidence, redundant work, separable units, estimated remaining time, and the next non-interruptible command.
+12. If the Controller sends REPLAN, follow the new execution shape only within the original authorization and acceptance standard. For each step, apply its accepted exit codes, expected failure signature, timeout, and partial-write check. Stop only for a result outside that contract. Do not infer broader scope, weaker validation, commits, publishing, or additional permissions.
+13. Apply DECISION and REVISION only within the current scope. Treat SCOPE_UPDATE as valid only when the Controller states the user-authorized scope delta; do not infer any additional change.
+14. When finished, send DONE with results, evidence, validation, files or links, and residual risks before ending this task. DONE is a completion claim; the Controller will show `🔍` during acceptance and only the Controller may set `✅`.
+15. The Controller owns final decisions and acceptance. Do not tell the user that the overall orchestration is complete.
+16. If the Controller sends LANGUAGE_UPDATE, use the new language for all subsequent human-readable coordination while keeping protocol tokens unchanged.
+17. If the Controller sends STOP, halt the affected work, preserve recoverable evidence, acknowledge the stop in PROGRESS with `next: none`, and end the task. Do not claim DONE unless the objective was actually completed.
 
 Code-writing rules
 - Modify only paths allowed by the write boundary.
@@ -82,6 +88,8 @@ completed:
 remaining:
 - <remaining acceptance item>
 estimate: <estimated remaining time, or unknown with a reason>
+incidentClass: <NONE|EXPECTED_RESULT|RECOVERABLE_CONTROL|CONTROL_DEGRADED|WORK_BLOCKER>
+localCorrectionAttempts: <local correction attempts used, or 0>
 next:
 - <next action; use none for DONE>
 needs:
@@ -100,5 +108,5 @@ send_message_to_thread({
 
 If controllerHostId is not required on the same host, remove both the coordination line and the entire hostId field instead of sending an empty string.
 
-If send_message_to_thread is unavailable, begin the final output with BLOCKED, explain that the coordination contract cannot be satisfied, and stop work that requires a Controller decision.
+If send_message_to_thread is unavailable, record `CONTROL_DEGRADED` in this task, preserve recoverable facts, and continue safe work that needs no new decision. Pause only a path whose work genuinely requires a Controller decision. After the tool recovers, send one consolidated PROGRESS rather than empty catch-up messages.
 ```

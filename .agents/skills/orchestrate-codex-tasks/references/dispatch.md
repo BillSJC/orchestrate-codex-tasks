@@ -94,7 +94,10 @@
         "完成测试",
         "提交 DONE 证据"
       ],
-      "healthCheckpoint": "首次测试后；已知长命令预计不超过 3 分钟"
+      "healthCheckpoint": "首次测试后；已知长命令预计不超过 3 分钟",
+      "failurePolicy": {
+        "localCorrectionBudget": 1
+      }
     }
   ],
   "boundaryOverlapAllowances": []
@@ -118,6 +121,7 @@
 | `resourceClaims` | 可选 Worker 正整数需求表，名称必须已在运行级容量中声明 |
 | `milestones` | 2–5 个可观察里程碑 |
 | `healthCheckpoint` | 首个复查点和已知长命令墙钟时间 |
+| `failurePolicy.localCorrectionBudget` | 同一可恢复控制错误允许的本地纠正次数，默认 1，只允许 0–2；预期结果不消耗预算 |
 
 projectless Worker 的环境可以包含：
 
@@ -141,6 +145,8 @@ worktree 起始状态只有两种：
 默认省略 `startingState`。
 
 `lean` 只能用于 `writesFiles=false`。推断出的默认档位不会写回规范化 manifest，因此旧 manifest 的内容与 `manifestHash` 保持兼容；显式字段才进入编译结果。
+
+新 draft 编译时显式写入默认 `failurePolicy`。升级前已经编译且没有该字段的协议 2 manifest 保持原 canonical 结构和 `manifestHash`；只在渲染 Worker Prompt 时应用默认预算 1，避免历史任务恢复时发生哈希漂移。
 
 ## 3. 校验和编译
 
@@ -263,6 +269,7 @@ python3 <SKILL_DIR>/scripts/dispatch.py render-worker \
   "hostId": "<OMIT_WHEN_NOT_NEEDED>",
   "controllerSeq": 4,
   "command": "CHECKPOINT",
+  "reason": "触发效率复查",
   "decision": "none",
   "instructions": [
     "到下一个安全边界停止启动新阶段",
@@ -283,24 +290,30 @@ python3 <SKILL_DIR>/scripts/dispatch.py render-command \
 
 使用输出的 `sendMessage` 调用实际消息工具，再写对应 outcome。序号来自账本，不从聊天上下文推断。
 
-`DECISION/REVISION` 只有在 outcome 为 `SUCCEEDED` 时才自动增加 `decisionRoundTrips`；失败、未知和重复 outcome 不增加。累计 3 次后，新的微放行会被拒绝，`CHECKPOINT` 仍可使用；后续 `REPLAN` 必须同时在 intent 和渲染输入中携带：
+`DECISION/REVISION` 只有在 outcome 为 `SUCCEEDED` 时才自动增加 `decisionRoundTrips`；失败、未知和重复 outcome 不增加。累计 3 次后，新的微放行会被拒绝，`CHECKPOINT` 仍可使用；后续 `REPLAN` 必须同时在 intent 和渲染输入中携带强类型步骤结果契约：
 
 ```json
 {
-  "executionPlan": {
-    "steps": [
-      "运行目标测试",
-      "根据首个失败修复",
-      "复测并整理证据"
-    ],
-    "stopOnFirstNonzero": true,
-    "stopOnTimeout": true,
-    "maxWallTimeMinutes": 30
-  }
+  "stepContracts": [
+    {
+      "step": "搜索可选标记",
+      "acceptedExitCodes": [0, 1],
+      "expectedFailureSignature": null,
+      "timeoutSeconds": 30,
+      "partialWriteCheck": "只读命令，不产生文件写入"
+    },
+    {
+      "step": "运行目标 TDD Red",
+      "acceptedExitCodes": [1],
+      "expectedFailureSignature": "missing production behavior",
+      "timeoutSeconds": 150,
+      "partialWriteCheck": "测试前后 git status 文件集一致"
+    }
+  ]
 }
 ```
 
-有界 `REPLAN` 成功后自动清零往返计数。未达到阈值时不强制新字段，以兼容已有运行。
+每一步都声明可接受退出码、可选预期失败签名、timeout 与部分写入核对；不要用全局 `stopOnFirstNonzero`。有界 `REPLAN` 成功后自动清零往返计数。历史 pending `executionPlan` 仍被 renderer 与 ledger 接受以便恢复，但新命令不再生成；同时提供两种字段会失败。Controller command 使用封闭字段集合，未知字段不会被静默丢弃。
 
 ## 7. 生命周期标题
 

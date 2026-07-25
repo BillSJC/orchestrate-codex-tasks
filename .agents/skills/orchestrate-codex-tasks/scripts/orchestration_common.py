@@ -171,8 +171,125 @@ def require_string_list(
     return [item.strip() for item in value]
 
 
+def normalize_failure_policy(
+    value: Any,
+    field: str = "failurePolicy",
+) -> dict[str, int]:
+    """Validate the bounded local correction budget for recoverable control errors."""
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise OrchestrationError("INVALID_FIELD", f"{field} must be an object")
+    unknown = sorted(set(value) - {"localCorrectionBudget"})
+    if unknown:
+        raise OrchestrationError(
+            "INVALID_FIELD",
+            f"{field} contains unsupported fields",
+            {"fields": unknown},
+        )
+    budget = value.get("localCorrectionBudget", 1)
+    if (
+        not isinstance(budget, int)
+        or isinstance(budget, bool)
+        or not 0 <= budget <= 2
+    ):
+        raise OrchestrationError(
+            "INVALID_FIELD",
+            f"{field}.localCorrectionBudget must be an integer from 0 to 2",
+        )
+    return {"localCorrectionBudget": budget}
+
+
+def normalize_step_contracts(
+    value: Any,
+    field: str = "stepContracts",
+) -> list[dict[str, Any]]:
+    """Validate per-step result contracts for a bounded REPLAN batch."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or not 1 <= len(value) <= 32:
+        raise OrchestrationError(
+            "INVALID_FIELD",
+            f"{field} must be a list containing 1 to 32 contracts",
+        )
+    normalized: list[dict[str, Any]] = []
+    allowed = {
+        "step",
+        "acceptedExitCodes",
+        "expectedFailureSignature",
+        "timeoutSeconds",
+        "partialWriteCheck",
+    }
+    for index, contract in enumerate(value):
+        item_field = f"{field}[{index}]"
+        if not isinstance(contract, dict):
+            raise OrchestrationError("INVALID_FIELD", f"{item_field} must be an object")
+        unknown = sorted(set(contract) - allowed)
+        if unknown:
+            raise OrchestrationError(
+                "INVALID_FIELD",
+                f"{item_field} contains unsupported fields",
+                {"fields": unknown},
+            )
+        exit_codes = contract.get("acceptedExitCodes")
+        if not isinstance(exit_codes, list) or not exit_codes or len(exit_codes) > 16:
+            raise OrchestrationError(
+                "INVALID_FIELD",
+                f"{item_field}.acceptedExitCodes must contain 1 to 16 exit codes",
+            )
+        if any(
+            not isinstance(code, int)
+            or isinstance(code, bool)
+            or code < -2147483648
+            or code > 4294967295
+            for code in exit_codes
+        ):
+            raise OrchestrationError(
+                "INVALID_FIELD",
+                (
+                    f"{item_field}.acceptedExitCodes must contain signed or unsigned "
+                    "32-bit process exit codes"
+                ),
+            )
+        if len(exit_codes) != len(set(exit_codes)):
+            raise OrchestrationError(
+                "INVALID_FIELD",
+                f"{item_field}.acceptedExitCodes must not contain duplicates",
+            )
+        timeout_seconds = contract.get("timeoutSeconds")
+        if (
+            not isinstance(timeout_seconds, int)
+            or isinstance(timeout_seconds, bool)
+            or not 1 <= timeout_seconds <= 86400
+        ):
+            raise OrchestrationError(
+                "INVALID_FIELD",
+                f"{item_field}.timeoutSeconds must be an integer from 1 to 86400",
+            )
+        expected_signature = contract.get("expectedFailureSignature")
+        if expected_signature is not None:
+            expected_signature = require_text(
+                expected_signature,
+                f"{item_field}.expectedFailureSignature",
+                maximum=2048,
+            )
+        normalized.append(
+            {
+                "step": require_text(contract.get("step"), f"{item_field}.step"),
+                "acceptedExitCodes": sorted(exit_codes),
+                "expectedFailureSignature": expected_signature,
+                "timeoutSeconds": timeout_seconds,
+                "partialWriteCheck": require_text(
+                    contract.get("partialWriteCheck"),
+                    f"{item_field}.partialWriteCheck",
+                ),
+            }
+        )
+    return normalized
+
+
 def normalize_execution_plan(value: Any, field: str = "executionPlan") -> dict[str, Any]:
-    """Validate a bounded batch of Worker actions used to replace micro-management."""
+    """Validate a legacy bounded batch retained for recovery compatibility."""
     if not isinstance(value, dict):
         raise OrchestrationError("INVALID_FIELD", f"{field} must be an object")
     allowed = {

@@ -88,6 +88,8 @@ completed:
 remaining:
 - <remaining acceptance item>
 estimate: <estimated remaining time, or unknown with a reason>
+incidentClass: <NONE|EXPECTED_RESULT|RECOVERABLE_CONTROL|CONTROL_DEGRADED|WORK_BLOCKER>
+localCorrectionAttempts: <local correction attempts used, or 0>
 next:
 - <next action in runLanguage; use none for DONE>
 needs:
@@ -104,6 +106,16 @@ evidence:
 - `DONE`
 
 `seq` 从 `001` 开始单调增加。每个消息只表达一个主要状态变化。
+
+`incidentClass` 的含义：
+
+- `NONE`：没有异常。
+- `EXPECTED_RESULT`：步骤契约接受的退出码或失败签名，例如无匹配搜索或签名正确的 TDD Red。
+- `RECOVERABLE_CONTROL`：引号、路径、参数、解析器、命令形状、已知 wrapper，或已经证明无未知部分写入的 patch/formatter 控制错误。
+- `CONTROL_DEGRADED`：标题、cursor、wait、renderer、临时 JSON 或消息传输等控制面暂时不可用。
+- `WORK_BLOCKER`：需要决定、权限、凭据、依赖或范围变化，存在不可逆风险、timeout、未知部分写入，或本地纠错预算已经耗尽。
+
+只有 `WORK_BLOCKER` 可以发送 `TYPE=BLOCKED`。前三类用 `PROGRESS` 报告并继续契约允许的安全工作。
 
 ### 4.1 ACCEPTED 与 PROGRESS 最低内容
 
@@ -125,6 +137,8 @@ completed:
 remaining:
 - <work blocked by this decision>
 estimate: blocked
+incidentClass: WORK_BLOCKER
+localCorrectionAttempts: <used attempts or 0>
 next:
 - option-a: <option and impact in runLanguage>
 - option-b: <option and impact in runLanguage>
@@ -159,24 +173,37 @@ evidence:
 - git-status: <git status --short or not-applicable>
 ```
 
-### 4.4 低噪声观察
+### 4.4 失败分类与局部纠错
 
-- `PROVISIONING/RUNNING` 最迟每 60 秒观察一次，`REVIEW` 最迟每 2 分钟一次，`BLOCKED` 事件驱动且最长每 5 分钟复核一次。
+1. 先核对步骤结果契约；命中的预期 nonzero 不消耗纠错预算。
+2. 对 `RECOVERABLE_CONTROL`，先证明没有未知部分写入、边界或权限变化，再在 Worker 的 `failurePolicy.localCorrectionBudget` 内本地修正。成功后发送 PROGRESS，不进入 BLOCKED。
+3. `CONTROL_DEGRADED` 保留真实工作状态；继续不依赖新决定的安全工作。工具恢复后发送一条合并后的 PROGRESS。
+4. timeout、未知部分写入、权限/范围变化或预算耗尽立即升级为 `WORK_BLOCKER`。
+5. 同一错误不得通过改写命令外观无限重试；纠错次数按根因累计。
+
+### 4.5 低噪声观察
+
+- 持续等待只覆盖 `PROVISIONING/RUNNING`；`REVIEW/BLOCKED` 仍计入活跃槽位，但在验收、决定或外部条件变化时按需读取。
 - 内部观察不产生逐轮用户心跳；状态未变化时，只有仍值得用户关注的长运行才约每 10 分钟汇报一次有信息量摘要。
-- 同一任务服务连续 2 次 timeout/无响应后熔断 2 分钟，不切换 `list/read/wait` 变体轮询；保留 cursor 与本地证据，冷却后只探测一次。
-- timeout 不能证明 Worker 消失，不得据此重复创建、发送或进入终态。
+- 正常等待 timeout 不是失败。任务服务临时异常按 5/15/30/60 秒上限退避；连续 2 次 timeout/无响应后熔断 2 分钟，不切换 `list/read/wait` 变体轮询。
+- 只有 cursor 改变时才落账。timeout 不能证明 Worker 消失或工作阻塞，不得据此重复创建、发送、改标题或进入终态。
 
 ## 5. 主控到 Worker 的消息
 
 ```text
 [ORCH run={{RUN_ID}} worker={{WORKER_ID}} controllerSeq={{SEQ}} command={{COMMAND}}]
 language: {{RUN_LANGUAGE}}
+reason: <reason in runLanguage or none>
 decision: <Controller decision in runLanguage or none>
 instructions:
 - <next action in runLanguage>
 acceptanceDelta:
 - <acceptance change in runLanguage or none>
+stepContracts:
+- {"step":"<bounded step>","acceptedExitCodes":[0],"expectedFailureSignature":null,"timeoutSeconds":120,"partialWriteCheck":"<verification>"}
 ```
+
+没有有界批次时省略整个 `stepContracts` 段。
 
 `COMMAND` 只能是：
 
@@ -190,7 +217,7 @@ acceptanceDelta:
 
 `controllerSeq` 从 `001` 开始严格单调增加。Worker 保存 `lastControllerSeq`，只执行更大的序号；重复或更旧的命令不得重复执行，只用 `PROGRESS` 确认已忽略并给出已应用的最新序号。
 
-成功发送 `DECISION/REVISION` 会由账本自动累计微放行往返。达到 3 次后拒绝更多微放行，主控先用 `CHECKPOINT` 获取安全边界，再发送带 `executionPlan.steps`、`maxWallTimeMinutes`、`stopOnFirstNonzero=true` 和 `stopOnTimeout=true` 的 `REPLAN`。该有界消息成功后清零计数；失败、未知和重复 outcome 不计数。
+成功发送 `DECISION/REVISION` 会由账本自动累计微放行往返。达到 3 次后拒绝更多微放行，主控先用 `CHECKPOINT` 获取安全边界，再发送带 `stepContracts` 的 `REPLAN`。每步必须声明可接受退出码、可选预期失败签名、timeout 和部分写入核对；只有契约外失败、timeout 或未知部分写入停止。该有界消息成功后清零计数；失败、未知和重复 outcome 不计数。历史 pending `executionPlan` 仍可恢复执行，但新命令不再生成它。
 
 主控不能用 `REPLAN` 或 `SCOPE_UPDATE` 自行扩大用户授权，也不能把交付物语言变化误写成 `LANGUAGE_UPDATE`。
 
@@ -266,7 +293,7 @@ acceptanceDelta:
 | `PROVISIONING` | 暂无或 `⌛️` | 只有 `clientThreadId`，等待真实任务 |
 | `RUNNING` | `✍️` | 正在执行或修订 |
 | `REVIEW` | `🔍` | Worker 已声明完成，主控正在验收或整合 |
-| `BLOCKED` | `⌛️` | 等待决定、澄清、权限、依赖或故障处理 |
+| `BLOCKED` | `⌛️` | 等待决定、澄清、权限、依赖，或处理 timeout/未知部分写入等真实工作阻塞 |
 | `ACCEPTED` | `✅` | 成功完成、通过归档就绪门，可以人工归档 |
 | `RETIRED` | `🗑️` | 已取消、废弃、失效或被取代，通过归档就绪门，可以人工归档 |
 
@@ -406,7 +433,7 @@ Worker 自称 `DONE` 只触发 `REVIEW` 和 `🔍`。只有主控验收并通过
 4. 有未提交唯一成果的写入型 Worker 必须先完成授权内的 checkpoint、Handoff 或其他持久化，不能直接创建第二个写入者接管同一边界。
 5. 向用户报告触发原因、决定、并发变化、下一检查点和风险。
 
-批量授权必须在 `executionPlan` 中设置墙钟上限和“首个 nonzero/timeout 即停”，避免每个可预见步骤都等待主控批准。`REPLAN` 不得降低验收、扩大范围、自动提交或制造低价值并发。只有一次有界重规划后仍无有效进展，才进入 `STALLED/BLOCKED`。
+批量授权必须使用逐步 `stepContracts`，把 `rg` 无匹配、签名正确的 TDD Red 等预期 nonzero 明确列入契约，并为每步设置 timeout 与部分写入检查。不要使用全局“首个 nonzero 即停”。`REPLAN` 不得降低验收、扩大范围、自动提交或制造低价值并发。只有一次有界重规划后仍无有效进展，才进入 `STALLED/BLOCKED`。
 
 ## 9. 并发调整
 

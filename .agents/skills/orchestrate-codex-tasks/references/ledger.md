@@ -198,7 +198,7 @@ request 只保存重试和核对所需的最小语义，不保存完整 Prompt�
 允许的 request 字段是封闭集合：
 
 - create：`environment`、`promptHash`、`title`、`targetHash`；
-- message：`command`、`reason`、`decision`、`instructions`、`acceptanceDelta`；
+- message：`command`、`reason`、`decision`、`instructions`、`acceptanceDelta`、`stepContracts`；历史 pending `executionPlan` 仅用于恢复兼容；
 - title：`title`、`target`；
 - Handoff：`targetBranch`、`destinationHostId`。
 
@@ -209,6 +209,8 @@ request 只保存重试和核对所需的最小语义，不保存完整 Prompt�
 `CREATE_THREAD` intent 会把 task 从 `QUEUED` 变为 `DISPATCHING` 并预留一个 `PROVISIONING` Worker，从而避免超额派发和重复创建。
 
 同一 kind 和目标同时只允许一个 `INTENT/UNKNOWN` operation。已有 pending create/message/title/Handoff 未核对前，新 request ID 也不能绕过门禁。
+
+若 `SET_TITLE` 的目标标题已经等于账本投影，返回 `TITLE_UNCHANGED/noChange=true`，不创建 operation。若 `CURSOR_UPDATED` 的值未变化，返回 `CURSOR_UNCHANGED/noChange=true`，不追加事件或 revision。
 
 ### 6.2 调用实际工具
 
@@ -243,12 +245,27 @@ outcome 同样使用封闭字段集合；不要直接保存原始工具返回。
 
 1. 核对 `runId` 和 `workerId`；
 2. 只接受大于账本 `lastSeq` 的序号；
-3. 将结构化字段转换为 `WORKER_MESSAGE_APPLIED`；
-4. 事务成功后再更新标题、回复或继续调度。
+3. 核对 `incidentClass`。Worker 把预期结果、可恢复控制错误或控制面降级误写为 `BLOCKED` 时，保留原始 `messageType=BLOCKED` 作为审计事实，但设置 `blockerDisposition=RECOVERABLE`；只有真实 `WORK_BLOCKER` 使用 `blockerDisposition=BLOCK`；
+4. 将结构化字段转换为 `WORKER_MESSAGE_APPLIED`；
+5. 事务成功后再更新标题、回复或继续调度。
 
-`DONE` 只把 Worker 置为 `REVIEW`。`ACCEPTED` 和 `RETIRED` 必须通过 `WORKER_STATE_CHANGED` 写入 `archiveReady=true` 和非空 `terminalReason`；账本不会归档任务。
+`DONE` 只把 Worker 置为 `REVIEW`。`BLOCKED + blockerDisposition=RECOVERABLE` 保持或恢复 `RUNNING`，不会进入生命周期 `BLOCKED`；该兼容路径用于旧 Worker 的错误分类，新 Worker 应在本地预算内自行纠正并发送 `PROGRESS`。`ACCEPTED` 和 `RETIRED` 必须通过 `WORKER_STATE_CHANGED` 写入 `archiveReady=true` 和非空 `terminalReason`；账本不会归档任务。
 
-每条 Worker event 还把当前 `details/next/needs/evidence` 的有界列表投影到 Worker 行；上下文恢复后不会只剩一个标题或一句 summary。健康事件保存有效进展、范围变化、timeout 和下次复查时间。成功发送 `DECISION/REVISION` 时账本自动增加决策往返，失败、未知或重复 outcome 不增加；累计 3 次自动进入 `AT_RISK` 并拒绝更多微放行，成功发送带安全 `executionPlan` 的 `REPLAN` 后清零。`STALLED` 必须与 `BLOCKED` 生命周期一致。
+每条 Worker event 还把当前 `details/next/needs/evidence` 的有界列表投影到 Worker 行；上下文恢复后不会只剩一个标题或一句 summary。健康事件保存有效进展、范围变化、timeout 和下次复查时间。成功发送 `DECISION/REVISION` 时账本自动增加决策往返，失败、未知或重复 outcome 不增加；累计 3 次自动进入 `AT_RISK` 并拒绝更多微放行，成功发送带 `stepContracts` 或历史兼容 `executionPlan` 的 `REPLAN` 后清零。`STALLED` 必须与 `BLOCKED` 生命周期一致。
+
+旧 canonical manifest 若没有 `failurePolicy`，激活、恢复和 `verify` 均保持原 `manifestHash` 与 task spec hash；默认预算只在 Prompt 渲染时注入。新 manifest 则把该策略写入账本，便于审计。
+
+允许的异常字段：
+
+```json
+{
+  "incidentClass": "RECOVERABLE_CONTROL",
+  "localCorrectionAttempts": 1,
+  "blockerDisposition": "RECOVERABLE"
+}
+```
+
+`blockerDisposition` 仅可用于 `messageType=BLOCKED`。省略时为向后兼容默认 `BLOCK`；因此 Controller 必须在应用旧 Worker 的 `BLOCKED` 前先分类。`BLOCK` 只接受 `incidentClass=WORK_BLOCKER`。
 
 读取紧凑快照：
 
@@ -401,3 +418,5 @@ schema 文件位于 [../scripts/sql/001_initial.sql](../scripts/sql/001_initial.
 5. 修复或从已验证备份恢复并完成 `snapshot + audit` 后再继续。
 
 不得把内存记忆冒充持久账本，也不得因账本故障自动归档、删除或重建 Worker。
+
+标题、cursor、等待快照、renderer 输入、临时 JSON、命令引号和消息传输属于控制面。它们失败时不得写入 Worker 生命周期 `BLOCKED`；确认无外部副作用的控制错误在预算内纠正，任务服务异常按退避处理。持久化不可用时把运行标记为 `DEGRADED` 并停止新的外部副作用，Worker 的真实工作状态保持不变。

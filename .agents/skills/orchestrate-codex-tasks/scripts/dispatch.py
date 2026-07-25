@@ -24,6 +24,8 @@ from orchestration_common import (  # noqa: E402
     load_json_file,
     normalize_boundary,
     normalize_execution_plan,
+    normalize_failure_policy,
+    normalize_step_contracts,
     print_result,
     require_string_list,
     require_text,
@@ -100,6 +102,23 @@ WORKER_FIELDS = {
     "healthCheckpoint",
     "coordinationProfile",
     "resourceClaims",
+    "failurePolicy",
+}
+COMMAND_INPUT_FIELDS = {
+    "protocolVersion",
+    "runId",
+    "runLanguage",
+    "workerId",
+    "threadId",
+    "hostId",
+    "controllerSeq",
+    "command",
+    "reason",
+    "decision",
+    "instructions",
+    "acceptanceDelta",
+    "executionPlan",
+    "stepContracts",
 }
 
 
@@ -281,6 +300,7 @@ def normalize_worker(
     index: int,
     project_id: str | None,
     resource_capacities: dict[str, int] | None,
+    include_default_failure_policy: bool = True,
 ) -> dict[str, Any]:
     if not isinstance(worker, dict):
         raise OrchestrationError("INVALID_FIELD", f"workers[{index}] must be an object")
@@ -464,6 +484,11 @@ def normalize_worker(
         normalized["coordinationProfile"] = coordination_profile
     if resource_claims is not None:
         normalized["resourceClaims"] = resource_claims
+    if "failurePolicy" in worker or include_default_failure_policy:
+        normalized["failurePolicy"] = normalize_failure_policy(
+            worker.get("failurePolicy"),
+            f"{prefix}.failurePolicy",
+        )
     return normalized
 
 
@@ -660,12 +685,17 @@ def normalize_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             "INVALID_FIELD",
             "workers must contain between 1 and 256 Worker specifications",
         )
+    # Preserve protocol-2 manifests compiled before failurePolicy existed. New
+    # drafts receive an explicit default; legacy compiled manifests get the
+    # same default only when their Worker Prompt is rendered.
+    include_default_failure_policy = "manifestHash" not in manifest
     workers = [
         normalize_worker(
             worker,
             index=index,
             project_id=project_id,
             resource_capacities=resource_capacities,
+            include_default_failure_policy=include_default_failure_policy,
         )
         for index, worker in enumerate(worker_values)
     ]
@@ -722,6 +752,20 @@ def get_worker(manifest: dict[str, Any], worker_id: str) -> dict[str, Any]:
 def list_text(items: list[str], language: str) -> str:
     separator = "；" if language == "zh-CN" else "; "
     return separator.join(items)
+
+
+def failure_policy_text(policy: dict[str, int], language: str) -> str:
+    budget = policy["localCorrectionBudget"]
+    if language == "zh-CN":
+        return (
+            f"同一可恢复控制错误最多本地纠正 {budget} 次；预期 nonzero 必须匹配"
+            "步骤结果契约；timeout、未知部分写入或预算耗尽按 WORK_BLOCKER 处理"
+        )
+    return (
+        f"allow at most {budget} local correction attempt(s) for the same recoverable "
+        "control error; an expected nonzero must match the step result contract; treat "
+        "a timeout, unknown partial write, or exhausted budget as WORK_BLOCKER"
+    )
 
 
 def extract_text_template(path: Path) -> str:
@@ -903,6 +947,13 @@ def render_worker_prompt(
         "ACCEPTANCE": list_text(worker["acceptance"], language),
         "MILESTONES": list_text(worker["milestones"], language),
         "HEALTH_CHECKPOINT": worker["healthCheckpoint"],
+        "FAILURE_POLICY": failure_policy_text(
+            normalize_failure_policy(
+                worker.get("failurePolicy"),
+                f"{worker['workerId']}.failurePolicy",
+            ),
+            language,
+        ),
         "COORDINATION_PROFILE": coordination_profile,
         "PROFILE_RULES": profile_rules,
         "RESOURCE_CLAIMS": canonical_json(worker.get("resourceClaims", {}))
@@ -985,7 +1036,7 @@ def planned_event(manifest: dict[str, Any], worker: dict[str, Any]) -> dict[str,
             "healthCheckpoint",
         )
     }
-    for optional_key in ("coordinationProfile", "resourceClaims"):
+    for optional_key in ("coordinationProfile", "resourceClaims", "failurePolicy"):
         if optional_key in worker:
             task[optional_key] = worker[optional_key]
     return {
@@ -1311,20 +1362,7 @@ def command_render_command(args: argparse.Namespace) -> dict[str, Any]:
     value = load_json_file(args.input_file)
     reject_unknown_fields(
         value,
-        allowed={
-            "protocolVersion",
-            "runId",
-            "runLanguage",
-            "workerId",
-            "threadId",
-            "hostId",
-            "controllerSeq",
-            "command",
-            "decision",
-            "instructions",
-            "acceptanceDelta",
-            "executionPlan",
-        },
+        allowed=COMMAND_INPUT_FIELDS,
         field="Controller command",
     )
     check_protocol(value.get("protocolVersion"))
@@ -1345,6 +1383,7 @@ def command_render_command(args: argparse.Namespace) -> dict[str, Any]:
         raise OrchestrationError("INVALID_SEQUENCE", "controllerSeq must be positive")
     thread_id = require_text(value.get("threadId"), "threadId", maximum=256)
     host_id = optional_text(value.get("hostId"), "hostId", maximum=256)
+    reason = optional_text(value.get("reason"), "reason") or "none"
     decision = optional_text(value.get("decision"), "decision") or "none"
     instructions = require_string_list(
         value.get("instructions"),
@@ -1364,12 +1403,24 @@ def command_render_command(args: argparse.Namespace) -> dict[str, Any]:
                 "executionPlan is allowed only for REPLAN",
             )
         execution_plan = normalize_execution_plan(value["executionPlan"])
+    step_contracts = normalize_step_contracts(value.get("stepContracts"))
+    if step_contracts and command != "REPLAN":
+        raise OrchestrationError(
+            "INVALID_FIELD",
+            "stepContracts is allowed only for REPLAN",
+        )
+    if execution_plan is not None and step_contracts:
+        raise OrchestrationError(
+            "INVALID_FIELD",
+            "Use stepContracts or legacy executionPlan, not both",
+        )
     prompt_lines = [
         (
             f"[ORCH run={run_id} worker={worker_id} "
             f"controllerSeq={sequence:03d} command={command}]"
         ),
         f"language: {language}",
+        f"reason: {reason}",
         f"decision: {decision}",
         "instructions:",
         *[f"- {instruction}" for instruction in instructions],
@@ -1388,6 +1439,13 @@ def command_render_command(args: argparse.Namespace) -> dict[str, Any]:
                 ),
             ]
         )
+    if step_contracts:
+        prompt_lines.extend(
+            [
+                "stepContracts:",
+                *[f"- {canonical_json(contract)}" for contract in step_contracts],
+            ]
+        )
     prompt = "\n".join(prompt_lines)
     validate_safe_data(prompt)
     send_message: dict[str, Any] = {"threadId": thread_id, "prompt": prompt}
@@ -1400,6 +1458,8 @@ def command_render_command(args: argparse.Namespace) -> dict[str, Any]:
         workerId=worker_id,
         controllerSeq=sequence,
         command=command,
+        executionPlan=execution_plan,
+        stepContracts=step_contracts,
         prompt=prompt,
         promptHash=stable_hash(prompt),
         sendMessage=send_message,

@@ -28,6 +28,8 @@ from orchestration_common import (  # noqa: E402
     load_json_file,
     normalize_boundary,
     normalize_execution_plan,
+    normalize_failure_policy,
+    normalize_step_contracts,
     print_result,
     require_string_list,
     require_text,
@@ -45,6 +47,14 @@ ACTIVE_STATES = ("PROVISIONING", "RUNNING", "REVIEW", "BLOCKED")
 TERMINAL_STATES = ("ACCEPTED", "RETIRED")
 WORKER_STATES = set(ACTIVE_STATES + TERMINAL_STATES)
 HEALTH_STATES = {"HEALTHY", "AT_RISK", "STALLED"}
+INCIDENT_CLASSES = {
+    "NONE",
+    "EXPECTED_RESULT",
+    "RECOVERABLE_CONTROL",
+    "CONTROL_DEGRADED",
+    "WORK_BLOCKER",
+}
+BLOCKER_DISPOSITIONS = {"BLOCK", "RECOVERABLE"}
 INTEGRATION_STATES = {
     "NONE",
     "PENDING_REVIEW",
@@ -146,6 +156,9 @@ EVENT_PAYLOAD_FIELDS = {
         "usefulProgress",
         "resumed",
         "cursor",
+        "incidentClass",
+        "localCorrectionAttempts",
+        "blockerDisposition",
     },
     "WORKER_STATE_CHANGED": {
         "state",
@@ -219,6 +232,7 @@ TASK_SPEC_FIELDS = {
     "healthCheckpoint",
     "coordinationProfile",
     "resourceClaims",
+    "failurePolicy",
 }
 
 
@@ -769,6 +783,12 @@ def task_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
                     "INVALID_FIELD",
                     "resourceClaims must map valid names to positive integers",
                 )
+    has_failure_policy = "failurePolicy" in task
+    failure_policy = (
+        normalize_failure_policy(task.get("failurePolicy"), "failurePolicy")
+        if has_failure_policy
+        else None
+    )
     validate_safe_data(task)
     normalized_task = dict(task)
     normalized_task.update(
@@ -782,6 +802,8 @@ def task_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "writeBoundary": write_boundary,
         }
     )
+    if has_failure_policy:
+        normalized_task["failurePolicy"] = failure_policy
     return {
         "taskId": task_id,
         "workerId": worker_id,
@@ -1330,9 +1352,12 @@ def mutate_record_event(
             raise OrchestrationError("INVALID_FIELD", "workerId is required")
         row = connection.execute(
             """
-            SELECT state, last_seq, last_controller_seq, last_controller_seq_reserved,
-                   progress_without_completion, closed_acceptance_json
-            FROM workers WHERE worker_id = ?
+            SELECT w.state, w.last_seq, w.last_controller_seq,
+                   w.last_controller_seq_reserved, w.progress_without_completion,
+                   w.closed_acceptance_json, p.spec_json
+            FROM workers AS w
+            JOIN planned_tasks AS p ON p.task_id = w.task_id
+            WHERE w.worker_id = ?
             """,
             (worker_id,),
         ).fetchone()
@@ -1359,6 +1384,87 @@ def mutate_record_event(
         message_type = payload.get("messageType")
         if message_type not in {"ACCEPTED", "PROGRESS", "BLOCKED", "DONE"}:
             raise OrchestrationError("INVALID_FIELD", f"Invalid Worker message type: {message_type}")
+        incident_class = payload.get(
+            "incidentClass",
+            "WORK_BLOCKER" if message_type == "BLOCKED" else "NONE",
+        )
+        if incident_class not in INCIDENT_CLASSES:
+            raise OrchestrationError(
+                "INVALID_FIELD",
+                f"Invalid incidentClass: {incident_class}",
+            )
+        correction_attempts = payload.get("localCorrectionAttempts", 0)
+        if (
+            not isinstance(correction_attempts, int)
+            or isinstance(correction_attempts, bool)
+            or not 0 <= correction_attempts <= 2
+        ):
+            raise OrchestrationError(
+                "INVALID_FIELD",
+                "localCorrectionAttempts must be an integer from 0 to 2",
+            )
+        task_spec = decode_json(row["spec_json"], {})
+        failure_policy = normalize_failure_policy(
+            task_spec.get("failurePolicy"),
+            "task.failurePolicy",
+        )
+        correction_budget = failure_policy["localCorrectionBudget"]
+        if (
+            incident_class == "RECOVERABLE_CONTROL"
+            and correction_attempts > correction_budget
+        ):
+            raise OrchestrationError(
+                "INCIDENT_BUDGET_EXCEEDED",
+                "Recoverable control incident exceeds the local correction budget",
+                {
+                    "localCorrectionAttempts": correction_attempts,
+                    "localCorrectionBudget": correction_budget,
+                },
+            )
+        if (
+            incident_class in {"NONE", "EXPECTED_RESULT", "CONTROL_DEGRADED"}
+            and correction_attempts != 0
+        ):
+            raise OrchestrationError(
+                "INCIDENT_CLASS_CONFLICT",
+                f"incidentClass={incident_class} cannot consume local correction attempts",
+            )
+        blocker_disposition = payload.get("blockerDisposition")
+        if message_type == "BLOCKED":
+            blocker_disposition = blocker_disposition or "BLOCK"
+            if blocker_disposition not in BLOCKER_DISPOSITIONS:
+                raise OrchestrationError(
+                    "INVALID_FIELD",
+                    f"Invalid blockerDisposition: {blocker_disposition}",
+                )
+            if blocker_disposition == "BLOCK" and incident_class != "WORK_BLOCKER":
+                raise OrchestrationError(
+                    "INCIDENT_CLASS_CONFLICT",
+                    "Only incidentClass=WORK_BLOCKER may enter lifecycle BLOCKED",
+                )
+            if (
+                blocker_disposition == "RECOVERABLE"
+                and incident_class
+                not in {
+                    "EXPECTED_RESULT",
+                    "RECOVERABLE_CONTROL",
+                    "CONTROL_DEGRADED",
+                }
+            ):
+                raise OrchestrationError(
+                    "INCIDENT_CLASS_CONFLICT",
+                    "RECOVERABLE disposition requires a non-work-blocker incident class",
+                )
+        elif blocker_disposition is not None:
+            raise OrchestrationError(
+                "INVALID_FIELD",
+                "blockerDisposition is valid only for a BLOCKED message",
+            )
+        elif incident_class == "WORK_BLOCKER":
+            raise OrchestrationError(
+                "INCIDENT_CLASS_CONFLICT",
+                "incidentClass=WORK_BLOCKER requires messageType=BLOCKED",
+            )
         summary = require_text(payload.get("summary"), "summary")
         milestone = require_text(payload.get("milestone"), "milestone")
         estimate = require_text(payload.get("estimate"), "estimate")
@@ -1381,7 +1487,10 @@ def mutate_record_event(
         if message_type == "DONE":
             new_state = "REVIEW"
         elif message_type == "BLOCKED":
-            new_state = "BLOCKED"
+            if blocker_disposition == "BLOCK":
+                new_state = "BLOCKED"
+            elif row["state"] in {"PROVISIONING", "RUNNING", "BLOCKED"}:
+                new_state = "RUNNING"
         elif row["state"] == "PROVISIONING":
             new_state = "RUNNING"
         elif row["state"] == "BLOCKED" and resumed is True:
@@ -2081,6 +2190,30 @@ def command_record(args: argparse.Namespace) -> dict[str, Any]:
                     revision=existing["revision"],
                     idempotencyKey=idempotency_key,
                 )
+            if event_type == "CURSOR_UPDATED":
+                requested_cursor = require_text(
+                    payload.get("cursor"),
+                    "cursor",
+                    maximum=16384,
+                )
+                cursor_row = connection.execute(
+                    "SELECT cursor FROM workers WHERE worker_id = ?",
+                    (worker_id,),
+                ).fetchone()
+                if cursor_row is None:
+                    raise OrchestrationError(
+                        "WORKER_NOT_FOUND",
+                        f"Unknown Worker: {worker_id}",
+                    )
+                if cursor_row["cursor"] == requested_cursor:
+                    return result(
+                        True,
+                        "CURSOR_UNCHANGED",
+                        duplicate=True,
+                        noChange=True,
+                        revision=get_run(connection)["revision"],
+                        idempotencyKey=idempotency_key,
+                    )
             mutate_record_event(connection, event_type, worker_id, payload, now)
             recompute_derived(connection, now)
             revision, _ = append_event(
@@ -2326,6 +2459,7 @@ def normalize_operation_request(
                 "instructions",
                 "acceptanceDelta",
                 "executionPlan",
+                "stepContracts",
             },
             field="SEND_MESSAGE request",
         )
@@ -2353,6 +2487,23 @@ def normalize_operation_request(
                 )
             normalized["executionPlan"] = normalize_execution_plan(
                 normalized["executionPlan"]
+            )
+        if normalized.get("stepContracts") is not None:
+            if command != "REPLAN":
+                raise OrchestrationError(
+                    "INVALID_FIELD",
+                    "stepContracts is allowed only for REPLAN",
+                )
+            normalized["stepContracts"] = normalize_step_contracts(
+                normalized["stepContracts"]
+            )
+        if (
+            normalized.get("executionPlan") is not None
+            and normalized.get("stepContracts")
+        ):
+            raise OrchestrationError(
+                "INVALID_FIELD",
+                "Use stepContracts or legacy executionPlan, not both",
             )
     elif kind == "SET_TITLE":
         reject_unknown_fields(
@@ -2481,6 +2632,27 @@ def command_intent(args: argparse.Namespace) -> dict[str, Any]:
                     "Reconcile the existing pending operation before recording another",
                     dict(unresolved_operation),
                 )
+            if kind == "SET_TITLE":
+                current_title = (
+                    run["controller_title"]
+                    if request["target"] == "controller"
+                    else (worker["title"] if worker is not None else None)
+                )
+                if request["target"] == "worker" and worker is None:
+                    raise OrchestrationError(
+                        "WORKER_NOT_FOUND",
+                        f"Unknown Worker: {worker_id}",
+                    )
+                if current_title == request["title"]:
+                    return result(
+                        True,
+                        "TITLE_UNCHANGED",
+                        duplicate=True,
+                        noChange=True,
+                        requestId=request_id,
+                        revision=run["revision"],
+                        title=current_title,
+                    )
 
             if kind == "CREATE_THREAD":
                 task = connection.execute(
@@ -2669,12 +2841,13 @@ def command_intent(args: argparse.Namespace) -> dict[str, Any]:
                     command == "REPLAN"
                     and decision_round_trips >= MAX_DECISION_ROUND_TRIPS
                     and request.get("executionPlan") is None
+                    and not request.get("stepContracts")
                 ):
                     raise OrchestrationError(
                         "EFFICIENCY_REVIEW_REQUIRED",
                         (
-                            "REPLAN must include a bounded executionPlan after "
-                            "three micro-control round trips"
+                            "REPLAN must include stepContracts or a legacy bounded "
+                            "executionPlan after three micro-control round trips"
                         ),
                         {
                             "workerId": worker_id,
@@ -2971,7 +3144,13 @@ def command_outcome(args: argparse.Namespace) -> dict[str, Any]:
                         """,
                         (MAX_DECISION_ROUND_TRIPS, now, worker_id),
                     )
-                elif command == "REPLAN" and request.get("executionPlan") is not None:
+                elif (
+                    command == "REPLAN"
+                    and (
+                        request.get("stepContracts")
+                        or request.get("executionPlan") is not None
+                    )
+                ):
                     connection.execute(
                         """
                         UPDATE workers
@@ -4075,6 +4254,7 @@ EXIT_CODES = {
     "ARCHIVE": 13,
     "HEALTH": 13,
     "EFFICIENCY": 13,
+    "INCIDENT": 13,
     "ACTIVE": 13,
     "DEPENDENCIES": 13,
     "UNSENT": 13,

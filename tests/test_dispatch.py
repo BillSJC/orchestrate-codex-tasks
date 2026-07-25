@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -209,12 +210,71 @@ class DispatchCliTest(unittest.TestCase):
         self.assertEqual(compiled["manifestHash"], validated["manifestHash"])
         saved = json.loads(compiled_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["manifestHash"], validated["manifestHash"])
+        self.assertEqual(
+            saved["workers"][0]["failurePolicy"],
+            {"localCorrectionBudget": 1},
+        )
+        self.assertEqual(
+            planned["events"][0]["payload"]["task"]["failurePolicy"],
+            {"localCorrectionBudget": 1},
+        )
         revalidated = self.invoke(
             "validate-manifest",
             "--manifest-file",
             str(compiled_path),
         )
         self.assertEqual(revalidated["manifestHash"], validated["manifestHash"])
+
+    def test_legacy_compiled_manifest_keeps_hash_and_runtime_failure_default(
+        self,
+    ) -> None:
+        source = self.write_json("legacy-source.json", self.manifest())
+        compiled_path = self.root / "legacy-compiled.json"
+        self.invoke(
+            "compile-manifest",
+            "--manifest-file",
+            str(source),
+            "--output",
+            str(compiled_path),
+        )
+        legacy = json.loads(compiled_path.read_text(encoding="utf-8"))
+        legacy.pop("manifestHash")
+        for worker in legacy["workers"]:
+            worker.pop("failurePolicy")
+        legacy_hash = hashlib.sha256(
+            json.dumps(
+                legacy,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        legacy["manifestHash"] = legacy_hash
+        legacy_path = self.write_json("legacy-v2.json", legacy)
+
+        validated = self.invoke(
+            "validate-manifest",
+            "--manifest-file",
+            str(legacy_path),
+        )
+        self.assertEqual(validated["manifestHash"], legacy_hash)
+        rendered = self.invoke(
+            "render-worker",
+            "--manifest-file",
+            str(legacy_path),
+            "--worker-id",
+            "W1",
+        )
+        self.assertIn("最多本地纠正 1 次", rendered["prompt"])
+        planned = self.invoke(
+            "plan-events",
+            "--manifest-file",
+            str(legacy_path),
+        )
+        self.assertNotIn(
+            "failurePolicy",
+            planned["events"][0]["payload"]["task"],
+        )
 
     def test_ready_respects_dependencies_slots_and_existing_state(self) -> None:
         manifest_file = self.write_json("manifest.json", self.manifest())
@@ -401,6 +461,10 @@ class DispatchCliTest(unittest.TestCase):
         self.assertEqual(strict["coordinationProfile"], "strict")
         self.assertGreater(len(strict["prompt"]), len(standard["prompt"]))
         self.assertNotIn("{{", strict["prompt"])
+        for rendered in (standard, lean, strict):
+            self.assertIn("WORK_BLOCKER", rendered["prompt"])
+            self.assertIn("CONTROL_DEGRADED", rendered["prompt"])
+            self.assertIn("本地纠正 1 次", rendered["prompt"])
 
         invalid_manifest = self.manifest()
         invalid_manifest["workers"][0]["coordinationProfile"] = "lean"
@@ -573,6 +637,22 @@ class DispatchCliTest(unittest.TestCase):
         )
         self.assertEqual(rejected_unknown["code"], "INVALID_FIELD")
 
+        invalid_policy = self.manifest()
+        invalid_policy["workers"][0]["failurePolicy"] = {
+            "localCorrectionBudget": 3
+        }
+        invalid_policy_file = self.write_json(
+            "invalid-failure-policy.json",
+            invalid_policy,
+        )
+        rejected_policy = self.invoke(
+            "validate-manifest",
+            "--manifest-file",
+            str(invalid_policy_file),
+            expected_returncode=10,
+        )
+        self.assertEqual(rejected_policy["code"], "INVALID_FIELD")
+
     def test_render_command_and_titles_enforce_sequence_and_archive_gate(self) -> None:
         command_file = self.write_json(
             "command.json",
@@ -622,6 +702,90 @@ class DispatchCliTest(unittest.TestCase):
         )
         self.assertIn("executionPlan:", replan["prompt"])
         self.assertIn("maxWallTimeMinutes=20", replan["prompt"])
+
+        contracts_file = self.write_json(
+            "step-contracts-command.json",
+            {
+                "protocolVersion": 2,
+                "runId": "run-demo",
+                "runLanguage": "zh-CN",
+                "workerId": "W1",
+                "threadId": "thread-W1",
+                "controllerSeq": 6,
+                "command": "REPLAN",
+                "reason": "按步骤结果契约继续",
+                "instructions": ["执行有界批次"],
+                "stepContracts": [
+                    {
+                        "step": "运行预期失败用例",
+                        "acceptedExitCodes": [1, 0],
+                        "expectedFailureSignature": "expected failure",
+                        "timeoutSeconds": 120,
+                        "partialWriteCheck": "确认工作树没有未知写入",
+                    }
+                ],
+            },
+        )
+        contracts = self.invoke(
+            "render-command",
+            "--input-file",
+            str(contracts_file),
+        )
+        self.assertIn("stepContracts:", contracts["prompt"])
+        self.assertIn('"acceptedExitCodes":[0,1]', contracts["prompt"])
+        self.assertEqual(
+            contracts["stepContracts"][0]["acceptedExitCodes"],
+            [0, 1],
+        )
+        self.assertIsNone(contracts["executionPlan"])
+
+        conflicting_file = self.write_json(
+            "conflicting-contracts-command.json",
+            {
+                "protocolVersion": 2,
+                "runId": "run-demo",
+                "runLanguage": "zh-CN",
+                "workerId": "W1",
+                "threadId": "thread-W1",
+                "controllerSeq": 7,
+                "command": "REPLAN",
+                "executionPlan": {
+                    "steps": ["运行测试"],
+                    "stopOnFirstNonzero": True,
+                    "stopOnTimeout": True,
+                    "maxWallTimeMinutes": 10,
+                },
+                "stepContracts": [
+                    {
+                        "step": "运行测试",
+                        "acceptedExitCodes": [0],
+                        "timeoutSeconds": 60,
+                        "partialWriteCheck": "确认无未知写入",
+                    }
+                ],
+            },
+        )
+        conflict = self.invoke(
+            "render-command",
+            "--input-file",
+            str(conflicting_file),
+            expected_returncode=10,
+        )
+        self.assertEqual(conflict["code"], "INVALID_FIELD")
+
+        empty_contracts = json.loads(contracts_file.read_text(encoding="utf-8"))
+        empty_contracts["stepContracts"] = []
+        empty_contracts_file = self.write_json(
+            "empty-step-contracts-command.json",
+            empty_contracts,
+        )
+        empty = self.invoke(
+            "render-command",
+            "--input-file",
+            str(empty_contracts_file),
+            expected_returncode=10,
+        )
+        self.assertEqual(empty["code"], "INVALID_FIELD")
 
         controller_title_file = self.write_json(
             "controller-title.json",

@@ -570,9 +570,9 @@ W3: 设计测试场景 ─┘
 
 1. 每个监控周期先对所有组执行 `timeoutMs: 0` 的增量快照，处理完成和需要关注的状态。
 2. 再对下一轮轮转组执行一次最长约 15 秒的阻塞等待。
-3. 每轮更新各 Worker 的 cursor；组的顺序不因单个 Worker 完成而任意重排。
+3. 只有值变化时才更新各 Worker 的 cursor；组的顺序不因单个 Worker 完成而任意重排。
 4. 任一 Worker 的 `BLOCKED` 或完成状态一旦被发现，立即处理，不等整轮结束。
-5. `PROVISIONING/RUNNING` 最迟每 60 秒观察一次，`REVIEW` 最迟每 2 分钟一次，`BLOCKED` 事件驱动且最长每 5 分钟复核一次。
+5. 持续等待只覆盖 `PROVISIONING/RUNNING`，最迟每 60 秒观察一次；`REVIEW/BLOCKED` 仍占活跃槽位，但在验收、决定或外部条件变化时按需读取。
 
 这个分组只解决工具单次 8 目标的限制，不表示主控应该为了填满并发值而制造低价值子任务。
 
@@ -679,6 +679,7 @@ Worker 自称完成后，主控先进入 `REVIEW` 并改为 `🔍`；只有验�
 - 验收与验证：{{ACCEPTANCE}}
 - 可观察里程碑：{{MILESTONES}}
 - 首个健康检查点与已知长命令：{{HEALTH_CHECKPOINT}}
+- 失败分类与本地纠错预算：{{FAILURE_POLICY}}
 
 强制协作协议
 1. 这是主控拆出的子任务。不要创建子 Agent、其他 Codex 任务或新的 Worker。
@@ -689,19 +690,24 @@ Worker 自称完成后，主控先进入 `REVIEW` 并改为 `🔍`；只有验�
    - 需要扩大权限、写入范围或外部影响；
    - 缺少关键输入、依赖或凭据；
    - 继续执行可能造成不可逆或高风险结果。
-4. 发生阻塞时：
+4. 命令或测试异常时先分类：
+   - 步骤契约接受的退出码/签名是 `EXPECTED_RESULT`，继续计划；
+   - 已证明无未知部分写入、越权或越界的引号、路径、解析器、命令形状或 patch 错误是 `RECOVERABLE_CONTROL`，在预算内本地纠正；
+   - 标题、cursor、等待、renderer 或消息传输失败是 `CONTROL_DEGRADED`，保留真实工作状态；
+   - 只有需要决定/权限/依赖/边界变化、不可逆风险、timeout、未知部分写入或预算耗尽才是 `WORK_BLOCKER`。
+5. 发生真实工作阻塞时：
    - 暂停受影响的动作；
-   - 使用 send_message_to_thread 向 controllerThreadId 发送 BLOCKED 消息；
+   - 使用 send_message_to_thread 向 controllerThreadId 发送 `incidentClass: WORK_BLOCKER` 的 BLOCKED 消息；
    - 给出阻塞原因、已经确认的事实、可选方案、推荐方案和不决策的影响；
    - 等待主控回复。可以继续处理与阻塞无关且明确安全的工作。
-5. 有实质性里程碑时向主控发送 PROGRESS，包含当前里程碑、新关闭和剩余验收项及带理由的 ETA；长命令开始前报告预期墙钟时间和安全中断边界。
-6. 保存最大 `controllerSeq`，只执行更大序号；重复或更旧命令只确认、不重复执行。
-7. 收到 CHECKPOINT 时在安全边界暂停新阶段，回报已完成/剩余验收、文件与未提交成果、冗余工作、可拆分单元、ETA 和下一条不可中断命令。
-8. 收到 REPLAN 时只调整原授权内的执行形状，不扩大范围或降低验收。
-9. 完成时必须先向主控发送 DONE 消息，包含结果、证据、验证、文件或链接、残余风险；发送后再结束本任务。DONE 只是完成声明，主控验收期间使用 `🔍`。
-10. 收到 STOP 时停止受影响工作，保留可恢复证据，用 PROGRESS 和 `next: none` 确认停止；目标没有真正完成时不得声称 DONE。
-11. 主控负责最终决策、`✅/🗑️` 终态和归档就绪审计。不要向主人宣称总体任务已经完成。
-12. 如果允许写代码：
+6. 有实质性里程碑时向主控发送 PROGRESS，包含当前里程碑、新关闭和剩余验收项及带理由的 ETA；长命令开始前报告预期墙钟时间和安全中断边界。
+7. 保存最大 `controllerSeq`，只执行更大序号；重复或更旧命令只确认、不重复执行。
+8. 收到 CHECKPOINT 时在安全边界暂停新阶段，回报已完成/剩余验收、文件与未提交成果、冗余工作、可拆分单元、ETA 和下一条不可中断命令。
+9. 收到 REPLAN 时只调整原授权内的执行形状，逐步应用可接受退出码、失败签名、timeout 和部分写入核对，不扩大范围或降低验收。
+10. 完成时必须先向主控发送 DONE 消息，包含结果、证据、验证、文件或链接、残余风险；发送后再结束本任务。DONE 只是完成声明，主控验收期间使用 `🔍`。
+11. 收到 STOP 时停止受影响工作，保留可恢复证据，用 PROGRESS 和 `next: none` 确认停止；目标没有真正完成时不得声称 DONE。
+12. 主控负责最终决策、`✅/🗑️` 终态和归档就绪审计。不要向主人宣称总体任务已经完成。
+13. 如果允许写代码：
    - 只修改“文件写入边界”允许的路径；
    - 在独立 worktree 内完成实现与测试；
    - 不自行 Handoff 到 Local；
@@ -726,6 +732,8 @@ completed:
 remaining:
 - <剩余验收项>
 estimate: <预计剩余时间；未知时给出理由>
+incidentClass: <NONE|EXPECTED_RESULT|RECOVERABLE_CONTROL|CONTROL_DEGRADED|WORK_BLOCKER>
+localCorrectionAttempts: <已使用次数或 0>
 next:
 - <下一步；DONE 时写 none>
 needs:
@@ -742,7 +750,7 @@ TYPE 只能使用：
 
 `seq` 从 `001` 单调增加，用于主控去重和恢复。
 
-如果 Worker 发现 `send_message_to_thread` 不可用，它必须在自己的最终输出中以 `BLOCKED` 开头并停止需要协调的工作。主控通过 `wait_threads` 或 `read_thread` 发现这一状态后接管处理。
+如果 Worker 发现 `send_message_to_thread` 不可用，它在任务内记录 `CONTROL_DEGRADED`，继续不依赖新决定的安全工作；只有真实需要主控决定的路径才暂停。主控通过 `wait_threads` 或 `read_thread` 发现并接管处理。
 
 主控发送给 Worker 的后续消息使用独立类型，避免与 Worker 状态混淆：
 
@@ -873,7 +881,7 @@ acceptanceDelta:
 2. 向 Worker 发送 `CHECKPOINT`，要求在安全边界暂停新阶段并返回已完成/剩余验收、文件与未提交成果、冗余执行、可拆分工作和 ETA。
 3. 主控在原始授权内选择：
    - 继续并设置下一个可验证里程碑和复查时间；
-   - 用 `REPLAN` 一次性授权已核对的有界 manifest，首个 nonzero/timeout 即停；
+   - 用 `REPLAN` 一次性授权已核对的 `stepContracts`；无匹配搜索、签名正确的 TDD Red 等预期 nonzero 继续，契约外失败、timeout 或未知部分写入才停止；
    - 删除被更强证据覆盖的重复执行，但不降低验收标准；
    - 收窄原 Worker，把独立剩余工作拆给新 Worker；
    - 一次有界重规划后仍无进展时，在保护成果后替换 Worker。
@@ -886,7 +894,7 @@ acceptanceDelta:
 
 收到 `BLOCKED` 后：
 
-1. 立即把 Worker 改名为 `⌛️`。
+1. 先核对 `incidentClass`；只有 `WORK_BLOCKER` 才把 Worker 改名为 `⌛️`，其他误报保持 `RUNNING` 并按可恢复路径处理。
 2. 判断主控是否已经拥有作出决定所需的权限和信息。
 3. 如果可以在原始用户意图内安全决策：
    - 记录决策。
@@ -1548,7 +1556,7 @@ https://github.com/BillSJC/orchestrate-codex-tasks/tree/master/.agents/skills/or
 
 - 运行只剩一个活跃 Worker，队列为空，连续约 15 分钟仍有可拆分剩余工作。
 - 主控发送 `CHECKPOINT`，发现 4 个已核对且互斥的测试批次。
-- 主控发送一次 `REPLAN`，批量授权完整 manifest 并要求首个 nonzero/timeout 即停，不再逐批等待批准。
+- 主控发送一次 `REPLAN`，为每个批次声明 accepted exit codes、预期失败签名、timeout 和部分写入核对，不再逐批等待批准。
 
 ### 场景 22：消息活跃但没有有效进展
 

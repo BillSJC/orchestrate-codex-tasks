@@ -211,7 +211,9 @@ read_thread({
 
 只有核对命令输出确实必要时才设置 `includeOutputs: true`，并保持输出上限紧凑。
 
-每次有效快照先用 `CURSOR_UPDATED` 落账，再开始下一轮等待。收到 Worker 协议消息时先写 `WORKER_MESSAGE_APPLIED`，再进行标题、回复或 Handoff。
+只有快照 cursor 与账本当前值不同时才用 `CURSOR_UPDATED` 落账。收到 Worker 协议消息时先分类并写 `WORKER_MESSAGE_APPLIED`，再进行标题、回复或 Handoff。
+
+持续等待目标只包含 `PROVISIONING/RUNNING`。`REVIEW/BLOCKED` 仍占活跃槽位，但只在验收、决定到达、外部条件变化或用户要求时读取。正常 `wait_threads` timeout 是无事件结果，不是控制系统或 Worker 阻塞。
 
 ### 5.1 超过 8 个活跃 Worker
 
@@ -358,9 +360,15 @@ handoff_thread({
 
 - 时间阈值只触发 `CHECKPOINT`，不直接终止任务。
 - 一次紧凑读取后，按 protocol reference 检查验收关闭、范围增长、逐步放行往返、timeout 和可拆分工作。
-- 可在原始授权内批量放行已核对的有界 manifest，并使用首个 nonzero/timeout 即停。
+- 可在原始授权内批量放行已核对的有界步骤；每步通过 `stepContracts` 声明可接受退出码、预期失败签名、timeout 和部分写入核对。无匹配搜索或签名正确的 TDD Red 不应停止批次。
 - 一次有界 `REPLAN` 后仍无有效进展时进入 `STALLED/BLOCKED`；保护并回收成果后，最多创建 1 个替代 Worker。
 - 不因 Worker 较慢就复制相同任务，也不让两个 Worker 同时修改同一脏 worktree。
+
+### 9.6 控制面故障
+
+- 引号、路径、参数、renderer 输入或临时 JSON 错误在确认无未知部分写入和外部副作用后，按本地纠错预算修正；不得把 Worker 改成 `BLOCKED`。
+- 标题、cursor、wait/read/list 或跨任务消息失败时保留真实生命周期；任务服务临时异常按 5/15/30/60 秒上限退避，连续 2 次 timeout/无响应后熔断 2 分钟。
+- 账本持久化失败时停止新的外部副作用并进入运行级 `DEGRADED`；这是控制面恢复状态，不是 `WORK_BLOCKER`。
 
 ## 10. 官方依据
 

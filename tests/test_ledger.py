@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -422,6 +423,130 @@ class LedgerCliTest(unittest.TestCase):
         )
         self.assertEqual(status["pendingOperations"], [])
 
+    def test_recoverable_control_incident_and_noop_updates_do_not_block(
+        self,
+    ) -> None:
+        self.initialize()
+        self.plan_worker()
+        create = self.record_intent(
+            "CREATE_THREAD",
+            "create-W1-for-control-errors",
+            {"promptHash": "c" * 64},
+            worker_id="W1",
+        )
+        self.record_outcome(
+            str(create["operationId"]),
+            "SUCCEEDED",
+            {"threadId": "thread-W1"},
+        )
+
+        first_cursor = self.record(
+            "cursor-W1-first",
+            "CURSOR_UPDATED",
+            {"cursor": "cursor-1"},
+            worker_id="W1",
+        )
+        unchanged_cursor = self.record(
+            "cursor-W1-unchanged",
+            "CURSOR_UPDATED",
+            {"cursor": "cursor-1"},
+            worker_id="W1",
+        )
+        self.assertEqual(unchanged_cursor["code"], "CURSOR_UNCHANGED")
+        self.assertTrue(unchanged_cursor["noChange"])
+        self.assertEqual(unchanged_cursor["revision"], first_cursor["revision"])
+
+        title_text = "✍️ [run-test-W1] 处理控制面降级"
+        title = self.record_intent(
+            "SET_TITLE",
+            "title-W1-control-errors",
+            {"target": "worker", "title": title_text},
+            worker_id="W1",
+        )
+        self.record_outcome(
+            str(title["operationId"]),
+            "SUCCEEDED",
+            {"summary": "标题已更新"},
+        )
+        revision_before_title_noop = self.invoke(
+            "status",
+            "--db",
+            str(self.database),
+        )["run"]["revision"]
+        unchanged_title = self.record_intent(
+            "SET_TITLE",
+            "title-W1-control-errors-unchanged",
+            {"target": "worker", "title": title_text},
+            worker_id="W1",
+        )
+        self.assertEqual(unchanged_title["code"], "TITLE_UNCHANGED")
+        self.assertTrue(unchanged_title["noChange"])
+        self.assertEqual(
+            unchanged_title["revision"],
+            revision_before_title_noop,
+        )
+
+        over_budget = self.record(
+            "worker-W1-over-budget-control",
+            "WORKER_MESSAGE_APPLIED",
+            {
+                "seq": 1,
+                "messageType": "BLOCKED",
+                "incidentClass": "RECOVERABLE_CONTROL",
+                "localCorrectionAttempts": 2,
+                "blockerDisposition": "RECOVERABLE",
+                "summary": "纠错次数超过 Worker 策略",
+                "milestone": "控制面恢复",
+                "completed": [],
+                "remaining": ["等待重新分类"],
+                "estimate": "未知",
+            },
+            worker_id="W1",
+            expected_returncode=13,
+        )
+        self.assertEqual(over_budget["code"], "INCIDENT_BUDGET_EXCEEDED")
+
+        recoverable = self.record(
+            "worker-W1-recoverable-control",
+            "WORKER_MESSAGE_APPLIED",
+            {
+                "seq": 1,
+                "messageType": "BLOCKED",
+                "incidentClass": "RECOVERABLE_CONTROL",
+                "localCorrectionAttempts": 1,
+                "blockerDisposition": "RECOVERABLE",
+                "summary": "任务控制消息暂时不可用，已继续安全本地工作",
+                "milestone": "控制面恢复",
+                "completed": ["完成一次本地纠正"],
+                "remaining": ["继续实现"],
+                "estimate": "下一个检查点",
+            },
+            worker_id="W1",
+        )
+        self.assertEqual(recoverable["code"], "EVENT_APPLIED")
+        status = self.invoke("status", "--db", str(self.database))
+        self.assertEqual(status["activeWorkers"][0]["state"], "RUNNING")
+
+        self.record(
+            "worker-W1-real-blocker",
+            "WORKER_MESSAGE_APPLIED",
+            {
+                "seq": 2,
+                "messageType": "BLOCKED",
+                "incidentClass": "WORK_BLOCKER",
+                "localCorrectionAttempts": 1,
+                "blockerDisposition": "BLOCK",
+                "summary": "所需权限缺失，无法继续受影响工作",
+                "milestone": "等待权限",
+                "completed": ["已穷尽安全本地替代方案"],
+                "remaining": ["获得权限后继续"],
+                "estimate": "等待外部决策",
+            },
+            worker_id="W1",
+        )
+        status = self.invoke("status", "--db", str(self.database))
+        self.assertEqual(status["activeWorkers"][0]["state"], "BLOCKED")
+
     def test_micro_control_round_trips_require_bounded_replan(self) -> None:
         self.initialize()
         self.plan_worker()
@@ -546,12 +671,21 @@ class LedgerCliTest(unittest.TestCase):
             {
                 "command": "REPLAN",
                 "instructions": ["执行完整批次"],
-                "executionPlan": {
-                    "steps": ["测试", "修复", "复测"],
-                    "stopOnFirstNonzero": True,
-                    "stopOnTimeout": True,
-                    "maxWallTimeMinutes": 30,
-                },
+                "stepContracts": [
+                    {
+                        "step": "运行测试",
+                        "acceptedExitCodes": [0, 1],
+                        "expectedFailureSignature": "expected failure",
+                        "timeoutSeconds": 300,
+                        "partialWriteCheck": "确认没有未知部分写入",
+                    },
+                    {
+                        "step": "修复并复测",
+                        "acceptedExitCodes": [0],
+                        "timeoutSeconds": 900,
+                        "partialWriteCheck": "复核工作树边界",
+                    },
+                ],
             },
             worker_id="W1",
         )
@@ -998,6 +1132,57 @@ class LedgerCliTest(unittest.TestCase):
             json.loads(exported_path.read_text(encoding="utf-8")),
             compiled,
         )
+
+    def test_legacy_compiled_manifest_remains_activatable_and_verifiable(
+        self,
+    ) -> None:
+        self.initialize()
+        compiled_path, compiled = self.compile_manifest(
+            self.manifest_for(self.worker_spec("W1")),
+            "legacy-compatible",
+        )
+        legacy = dict(compiled)
+        legacy["workers"] = [dict(worker) for worker in compiled["workers"]]
+        for worker in legacy["workers"]:
+            worker.pop("failurePolicy")
+        legacy.pop("manifestHash")
+        legacy_hash = hashlib.sha256(
+            json.dumps(
+                legacy,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        legacy["manifestHash"] = legacy_hash
+        compiled_path.write_text(
+            json.dumps(legacy, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+
+        activated = self.invoke(
+            "activate-manifest",
+            "--db",
+            str(self.database),
+            "--controller-thread-id",
+            self.controller,
+            "--manifest-file",
+            str(compiled_path),
+        )
+        self.assertEqual(activated["manifestHash"], legacy_hash)
+        verified = self.invoke("verify", "--db", str(self.database))
+        self.assertTrue(verified["valid"])
+        exported_path = self.root / "legacy-exported.json"
+        self.invoke(
+            "manifest",
+            "--db",
+            str(self.database),
+            "--output",
+            str(exported_path),
+        )
+        exported = json.loads(exported_path.read_text(encoding="utf-8"))
+        self.assertEqual(exported["manifestHash"], legacy_hash)
+        self.assertNotIn("failurePolicy", exported["workers"][0])
 
     def test_manifest_cannot_silently_omit_nonterminal_tasks(self) -> None:
         self.initialize()
