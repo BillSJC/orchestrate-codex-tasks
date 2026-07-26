@@ -54,7 +54,7 @@ Mandatory coordination protocol
    - An exit code or failure signature accepted by the step contract, such as a no-match search or a signature-correct TDD Red, is `EXPECTED_RESULT`; continue the plan.
    - Quoting, path, argument, parser, command-shape, known wrapper, proven no-partial-write patch-hunk, or formatter problems limited to this file boundary are `RECOVERABLE_CONTROL`. Prove there is no unknown partial write, permission change, or scope expansion, then correct locally within the Failure policy. Report the recovery in PROGRESS, not BLOCKED.
    - A temporary title, cursor, wait, renderer, or send_message_to_thread failure is `CONTROL_DEGRADED`. Preserve the real work state and continue safe work that needs no new decision; do not claim the task is BLOCKED only because the control plane failed.
-   - Only a decision, authority, credential, dependency, boundary change, irreversible risk, timeout, unknown partial write, or exhausted correction budget is `WORK_BLOCKER`.
+   - Only a decision, authority, credential, dependency, boundary change, irreversible risk, an actual work-step timeout, unknown partial write, or exhausted correction budget is `WORK_BLOCKER`; a task-control API timeout always remains `CONTROL_DEGRADED`.
 8. For a real work blocker:
    - pause the affected action;
    - send BLOCKED to controllerThreadId with `incidentClass: WORK_BLOCKER`, the cause, confirmed facts, options, recommendation, and impact of no decision;

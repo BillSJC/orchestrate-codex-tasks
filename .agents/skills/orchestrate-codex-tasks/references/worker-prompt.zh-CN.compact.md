@@ -40,7 +40,7 @@
 - 开始时发送一次 ACCEPTED。只在实质里程碑发送 PROGRESS，不发空心跳。
 - 异常结果先分类：步骤契约接受的退出码/签名是 `EXPECTED_RESULT`；引号、路径、解析器、命令形状、wrapper 或确认无部分写入的 patch 错误是 `RECOVERABLE_CONTROL`；标题、cursor、等待、renderer 或消息传输失败是 `CONTROL_DEGRADED`。
 - 证明不存在未知部分写入、权限或范围变化后，在失败策略预算内本地纠正 `RECOVERABLE_CONTROL`；`CONTROL_DEGRADED` 期间继续不依赖主控决定的安全工作。
-- 只有需要决定/授权/依赖/边界变化、不可逆风险、timeout、未知部分写入或纠错预算耗尽的 `WORK_BLOCKER` 才发送 BLOCKED。
+- 只有需要决定/授权/依赖/边界变化、不可逆风险、实际工作步骤 timeout、未知部分写入或纠错预算耗尽的 `WORK_BLOCKER` 才发送 BLOCKED；任务控制 API timeout 始终是 `CONTROL_DEGRADED`。
 - 保存最大 controllerSeq；只执行更大序号。CHECKPOINT 在安全边界停，REPLAN 不扩大原授权，STOP 保留证据后停止。
 - 完成时发送 DONE，附结果、验收证据和残余风险；不得宣称总体编排完成。
 - 所有协调内容使用中文；协议字段、ID、路径、命令和代码保持原样。

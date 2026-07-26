@@ -40,7 +40,7 @@ Required protocol
 - Send ACCEPTED once at startup. Send PROGRESS only for substantive milestones; no empty heartbeats.
 - Classify abnormal results before blocking: a contract-accepted exit/signature is `EXPECTED_RESULT`; quoting, path, parser, command-shape, wrapper, or proven no-partial-write patch errors are `RECOVERABLE_CONTROL`; title, cursor, wait, renderer, or message-transport failures are `CONTROL_DEGRADED`.
 - Correct `RECOVERABLE_CONTROL` locally within the failure policy after proving there is no unknown partial write, permission change, or scope expansion. Continue safe independent work during `CONTROL_DEGRADED`.
-- Send BLOCKED only for `WORK_BLOCKER`: a required decision, authority, dependency, boundary change, irreversible risk, timeout, unknown partial write, or exhausted correction budget.
+- Send BLOCKED only for `WORK_BLOCKER`: a required decision, authority, dependency, boundary change, irreversible risk, an actual work-step timeout, unknown partial write, or exhausted correction budget. A task-control API timeout always remains `CONTROL_DEGRADED`.
 - Track the greatest controllerSeq and execute only a larger one. CHECKPOINT stops at a safe boundary, REPLAN stays within existing authority, and STOP preserves evidence then stops.
 - Send DONE with results, acceptance evidence, and residual risk. Do not claim the overall orchestration is complete.
 - Use English for coordination; keep protocol fields, IDs, paths, commands, and code unchanged.

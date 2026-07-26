@@ -237,7 +237,7 @@ outcome 同样使用封闭字段集合；不要直接保存原始工具返回。
 
 工具调用超时、返回含糊或 Controller 在写 outcome 前中断时，不能直接重试。恢复后先查看 pending operations 并核对外部事实，再写 `SUCCEEDED`、`FAILED` 或 `UNKNOWN`。
 
-只有 `CREATE_THREAD` 已确认 `FAILED` 时，才可用带非空 `reason` 的 `TASK_STATUS_CHANGED` 将 `DISPATCHING` task 恢复为 `QUEUED`，再使用新的 request ID 重试。`UNKNOWN` 不能重置排队状态。
+只有 `CREATE_THREAD` 已确认 `FAILED` 时，才可用带非空 `reason` 的 `TASK_STATUS_CHANGED` 将 `DISPATCHING` task 恢复为 `QUEUED`，再使用新的 request ID 发起一个新的受控尝试。每次明确失败后都可重新核对并重复此循环，次数和总时长无上限，但任何时刻只允许一个在途 create。`UNKNOWN` 不能重置排队状态。
 
 ## 7. 状态、消息与健康记录
 
@@ -348,6 +348,20 @@ python3 <SKILL_DIR>/scripts/ledger.py takeover \
 
 无法唯一匹配时保持阻塞，不创建重复 Worker。
 
+### 8.1 控制面恢复 heartbeat
+
+任务服务控制面异常但账本仍可写时：
+
+1. 先用 `RUN_UPDATED status=DEGRADED` 保存运行级状态；不要改变 Worker 生命周期或 task 状态。
+2. 对含糊的任务工具调用保留 `INTENT/UNKNOWN`。时间流逝、没有新 worktree 或一次列表无匹配都不能单独把它改成 `FAILED`。
+3. 当前 turn 将结束且原始授权要求持续推进时，用 `DECISION_RECORDED source=CONTROLLER` 记录启用恢复 heartbeat 的原因、确定性名称和停止条件，再调用当前运行时 automation 工具。
+4. heartbeat 属于产品级 Controller 唤醒，不属于 Worker task，也不写入现有 `operations` 表；不得伪造 `AUTOMATION` operation kind、修改 schema 或把原始 RRULE 写进账本。automation 系统保存真实 ID；恢复时按包含 `runId` 的名称检查并优先更新。
+5. heartbeat 每次唤醒都先执行 `snapshot`，再收集最小 observed facts 并 `audit`。只有原 operation 已被外部事实确认成功或失败后，才能写最终 outcome；未恢复时保持 heartbeat 活动。
+6. 控制面恢复核对按 5/15/30/60 秒退避，随后每 2 分钟无限循环。次数、连续失败数和总时长不写成停止预算，也不得据此更新为 `WAITING/COMPLETE` 或改变 Worker 健康与生命周期。
+7. 控制面恢复并闭合 pending operation 后，用 `RUN_UPDATED status=ACTIVE` 恢复运行；停用/删除 heartbeat，并用新的 `DECISION_RECORDED` 保存清理摘要。
+
+账本本身不可写时，继续遵守第 11 节：停止新的外部副作用。此时不得创建 heartbeat 来绕过账本故障；只有账本恢复并完成 `snapshot + audit` 后才能恢复自主调度。
+
 ## 9. 备份、恢复和导出
 
 在每个 cycle 完成、重大重规划前或接管前创建一致备份：
@@ -420,3 +434,7 @@ schema 文件位于 [../scripts/sql/001_initial.sql](../scripts/sql/001_initial.
 不得把内存记忆冒充持久账本，也不得因账本故障自动归档、删除或重建 Worker。
 
 标题、cursor、等待快照、renderer 输入、临时 JSON、命令引号和消息传输属于控制面。它们失败时不得写入 Worker 生命周期 `BLOCKED`；确认无外部副作用的控制错误在预算内纠正，任务服务异常按退避处理。持久化不可用时把运行标记为 `DEGRADED` 并停止新的外部副作用，Worker 的真实工作状态保持不变。
+
+当用户已经要求持续推进且账本可写时，任务服务异常跨越当前 turn 必须按 8.1 建立当前 Controller thread heartbeat；不得输出 blocked/final 后依赖用户手工发送“继续”。控制面失败无论持续多久都无限重试，只读核对不设次数或时长上限；控制面恢复、运行完成、用户暂停或取消时才清理该 heartbeat。
+
+账本持久化本身故障时仍停止新的外部副作用，但账本恢复尝试也持续无限退避；不得因恢复次数或经过时长结束 Goal。无限恢复不放宽 SQLite 事实源、幂等、权限或未知部分写入边界。

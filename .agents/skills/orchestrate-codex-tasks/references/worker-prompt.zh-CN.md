@@ -54,7 +54,7 @@
    - 步骤契约接受的退出码或失败签名（例如无匹配搜索、签名正确的 TDD Red）属于 `EXPECTED_RESULT`，继续计划。
    - 引号、路径、参数、解析器、命令形状、已知工具 wrapper、确认无部分写入的 patch hunk，以及只涉及本文件边界的 formatter 问题属于 `RECOVERABLE_CONTROL`。先证明无未知部分写入、权限或范围变化，再按“失败处理策略”在本任务内纠正；成功后用 PROGRESS 报告，不发送 BLOCKED。
    - 标题、cursor、等待、renderer 或 send_message_to_thread 暂时失败属于 `CONTROL_DEGRADED`。保留真实工作状态，继续不依赖新决定的安全工作，不得仅因控制面异常宣称任务 BLOCKED。
-   - 只有需要决定/权限/凭据/依赖/范围变化、存在不可逆风险、timeout、未知部分写入，或同一可恢复错误耗尽本地预算时，才属于 `WORK_BLOCKER`。
+   - 只有需要决定/权限/凭据/依赖/范围变化、存在不可逆风险、实际工作步骤 timeout、未知部分写入，或同一可恢复错误耗尽本地预算时，才属于 `WORK_BLOCKER`；任务控制 API timeout 始终属于 `CONTROL_DEGRADED`。
 8. 发生真实工作阻塞时：
    - 暂停受影响的动作；
    - 向 controllerThreadId 发送 BLOCKED，设置 `incidentClass: WORK_BLOCKER`，并包含原因、已确认事实、选项、推荐方案和不决策的影响；

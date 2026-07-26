@@ -759,12 +759,14 @@ def failure_policy_text(policy: dict[str, int], language: str) -> str:
     if language == "zh-CN":
         return (
             f"同一可恢复控制错误最多本地纠正 {budget} 次；预期 nonzero 必须匹配"
-            "步骤结果契约；timeout、未知部分写入或预算耗尽按 WORK_BLOCKER 处理"
+            "步骤结果契约；实际工作步骤 timeout、未知部分写入或预算耗尽按 "
+            "WORK_BLOCKER 处理；任务控制 API timeout 始终按 CONTROL_DEGRADED 处理"
         )
     return (
         f"allow at most {budget} local correction attempt(s) for the same recoverable "
         "control error; an expected nonzero must match the step result contract; treat "
-        "a timeout, unknown partial write, or exhausted budget as WORK_BLOCKER"
+        "an actual work-step timeout, unknown partial write, or exhausted budget as "
+        "WORK_BLOCKER; always treat a task-control API timeout as CONTROL_DEGRADED"
     )
 
 

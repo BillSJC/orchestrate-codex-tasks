@@ -113,7 +113,7 @@ evidence:
 - `EXPECTED_RESULT`：步骤契约接受的退出码或失败签名，例如无匹配搜索或签名正确的 TDD Red。
 - `RECOVERABLE_CONTROL`：引号、路径、参数、解析器、命令形状、已知 wrapper，或已经证明无未知部分写入的 patch/formatter 控制错误。
 - `CONTROL_DEGRADED`：标题、cursor、wait、renderer、临时 JSON 或消息传输等控制面暂时不可用。
-- `WORK_BLOCKER`：需要决定、权限、凭据、依赖或范围变化，存在不可逆风险、timeout、未知部分写入，或本地纠错预算已经耗尽。
+- `WORK_BLOCKER`：需要决定、权限、凭据、依赖或范围变化，存在不可逆风险、实际工作步骤 timeout、未知部分写入，或本地纠错预算已经耗尽。任务控制 API timeout 不属于此类。
 
 只有 `WORK_BLOCKER` 可以发送 `TYPE=BLOCKED`。前三类用 `PROGRESS` 报告并继续契约允许的安全工作。
 
@@ -178,15 +178,27 @@ evidence:
 1. 先核对步骤结果契约；命中的预期 nonzero 不消耗纠错预算。
 2. 对 `RECOVERABLE_CONTROL`，先证明没有未知部分写入、边界或权限变化，再在 Worker 的 `failurePolicy.localCorrectionBudget` 内本地修正。成功后发送 PROGRESS，不进入 BLOCKED。
 3. `CONTROL_DEGRADED` 保留真实工作状态；继续不依赖新决定的安全工作。工具恢复后发送一条合并后的 PROGRESS。
-4. timeout、未知部分写入、权限/范围变化或预算耗尽立即升级为 `WORK_BLOCKER`。
-5. 同一错误不得通过改写命令外观无限重试；纠错次数按根因累计。
+4. 实际工作步骤 timeout、未知部分写入、权限/范围变化或预算耗尽立即升级为 `WORK_BLOCKER`。主控任务 `create/list/read/wait/send/title/handoff-status` timeout 始终是运行级 `CONTROL_DEGRADED`，不因重复次数或时长升级。
+5. 同一 `RECOVERABLE_CONTROL` 错误不得通过改写命令外观无限重试；纠错次数按根因累计。本条不适用于 4.6 的 `CONTROL_DEGRADED` 无限恢复。
 
 ### 4.5 低噪声观察
 
 - 持续等待只覆盖 `PROVISIONING/RUNNING`；`REVIEW/BLOCKED` 仍计入活跃槽位，但在验收、决定或外部条件变化时按需读取。
 - 内部观察不产生逐轮用户心跳；状态未变化时，只有仍值得用户关注的长运行才约每 10 分钟汇报一次有信息量摘要。
-- 正常等待 timeout 不是失败。任务服务临时异常按 5/15/30/60 秒上限退避；连续 2 次 timeout/无响应后熔断 2 分钟，不切换 `list/read/wait` 变体轮询。
+- 正常等待 timeout 不是失败。任务服务异常按 5/15/30/60 秒退避；连续 2 次 timeout/无响应后每 2 分钟做一次单一恢复核对并无限循环，不切换 `list/read/wait` 变体轮询。熔断只降低频率，不是停止条件。
 - 只有 cursor 改变时才落账。timeout 不能证明 Worker 消失或工作阻塞，不得据此重复创建、发送、改标题或进入终态。
+
+### 4.6 主控控制面降级与自主唤醒
+
+`create/list/read/wait/send/title/handoff-status` 超时、失联或结果含糊属于主控运行级 `CONTROL_DEGRADED`：
+
+1. 用 `RUN_UPDATED status=DEGRADED` 保存运行状态，保留所有 Worker 生命周期；含糊的外部 operation 保持 `INTENT/UNKNOWN`。
+2. 不把重复控制面 timeout 累计为 Worker `AT_RISK/STALLED`，不进入 `WAITING_FOR_USER`，不调用 goal `blocked`，也不输出 final。控制面重试次数、连续失败次数和总等待时长均无上限；只有真实决定、权限、依赖或不可逆风险才需要用户。
+3. 用户已要求持续推进、监控到完成或当前 Goal 尚未完成，而 turn 将结束时，创建或更新附着于当前 Controller thread 的分钟级 heartbeat。名称包含 `runId`，并要求下一轮从 ledger `snapshot` 恢复、核对 pending operation、完成一次退避后的恢复审计，再继续原 DAG。
+4. heartbeat 不得创建新 Worker、扩大授权或绕过 `UNKNOWN` 去重门；它不计入 Worker 并发，也不改变标题状态机。
+5. heartbeat 每次只执行一次只读恢复审计；未恢复时保持活动并等待下一次唤醒。`UNKNOWN` 阶段不得重复 create/message/title/Handoff 等外部写操作；只有外部事实排除副作用并把上一轮闭合为 `FAILED` 后，才用新 request ID 发起一个新的受控尝试。“核对 → 明确失败 → 单次新尝试”循环本身无限，但任何时刻只允许一个在途写操作。
+6. 控制面恢复后先完成 `snapshot + observed facts + audit`，闭合 operation，再用 `RUN_UPDATED status=ACTIVE` 恢复。随后停用或删除 heartbeat。
+7. heartbeat 能力不可用时，在当前 Goal/turn 内继续每 2 分钟的无限退避重试；控制面故障永远不能满足 blocked/终止门槛，不能要求用户用“继续”充当默认调度器。
 
 ## 5. 主控到 Worker 的消息
 
@@ -293,7 +305,7 @@ stepContracts:
 | `PROVISIONING` | 暂无或 `⌛️` | 只有 `clientThreadId`，等待真实任务 |
 | `RUNNING` | `✍️` | 正在执行或修订 |
 | `REVIEW` | `🔍` | Worker 已声明完成，主控正在验收或整合 |
-| `BLOCKED` | `⌛️` | 等待决定、澄清、权限、依赖，或处理 timeout/未知部分写入等真实工作阻塞 |
+| `BLOCKED` | `⌛️` | 等待决定、澄清、权限、依赖，或处理实际工作步骤 timeout/未知部分写入等真实工作阻塞 |
 | `ACCEPTED` | `✅` | 成功完成、通过归档就绪门，可以人工归档 |
 | `RETIRED` | `🗑️` | 已取消、废弃、失效或被取代，通过归档就绪门，可以人工归档 |
 
@@ -324,6 +336,8 @@ Worker 自称 `DONE` 只触发 `REVIEW` 和 `🔍`。只有主控验收并通过
 | `STALLED` | 一次有界重规划后仍没有有效进展，或确实等待外部决定；进入 `BLOCKED` |
 
 时间只能触发审查，不能直接触发 `STOP`、`RETIRED` 或替代 Worker。
+
+运行级 `DEGRADED` 与 Worker 健康度正交。控制面恢复期间 Worker 可保持 `HEALTHY/RUNNING`；无论失败次数或持续时间，不得仅因主控暂时读不到任务就把 Worker 改为 `AT_RISK/STALLED/BLOCKED` 或结束 Goal。
 
 ### 6.7 归档就绪门
 
@@ -469,7 +483,7 @@ effective = min(requested, 值得独立派发且已就绪的任务数, 当前环
 
 1. 从稳定运行目录打开账本，执行一次只读事务 `snapshot`，同时取得 verification、边界化 status 和详细 pending operations。
 2. 从账本恢复 `runId`、`runLanguage`、Controller、当前 manifest、Worker 地址、cursor 和序号。
-3. 列出任务并匹配 `runId-workerId`，用即时等待快照和必要的紧凑读取形成 observed facts，再执行只读 `audit`；任务服务 timeout 时遵循 4.4 的熔断规则。
+3. 列出任务并匹配 `runId-workerId`，用即时等待快照和必要的紧凑读取形成 observed facts，再执行只读 `audit`；任务服务 timeout 时遵循 4.5–4.6 的低噪声无限恢复规则。
 4. 先核对 pending `INTENT/UNKNOWN`；没有外部证据前不重试创建、消息、标题或 Handoff。
 5. 只接受比 `lastSeq` 更新的 Worker 消息。
 6. 新命令只使用 ledger 分配的更大 `controllerSeq`，绝不复用旧序号。
@@ -480,3 +494,6 @@ effective = min(requested, 值得独立派发且已就绪的任务数, 当前环
 11. 账本缺失或损坏时按 ledger reference 从备份恢复或保守重建；无法唯一核对就阻塞。
 12. 不因上下文丢失重复创建 Worker，不把内存状态冒充持久账本。
 13. 不因恢复、失败、完成或停止而自动归档任何任务；只恢复已有 `archiveReady` 值，不推断或自动执行归档。
+14. 恢复时检查是否已有包含 `runId` 的活动 heartbeat；优先更新，禁止重复创建。
+15. `CREATE_THREAD` 只有在原 operation 已确认 `FAILED`、目标 Worker 和 worktree 均不存在后，才恢复 task 为 `QUEUED` 并使用新 request ID 发起一次新的受控尝试。若再次明确失败，重新核对后继续同样循环且总次数无上限；每轮只允许一个在途 create。`UNKNOWN` 不能仅凭时间流逝改成失败。
+16. 控制面恢复、运行终态、用户暂停或取消后停用/删除本次运行的 heartbeat，避免残留唤醒。

@@ -32,6 +32,7 @@
 | 项目发现 | 客户端项目配置 | `list_projects` |
 | 转移任务与代码 | 客户端 Git/worktree 流程 | `handoff_thread` |
 | 查询转移 | 客户端操作状态 | `get_handoff_status` |
+| 跨 turn 自主恢复 | 当前任务定时唤醒 | `automation_update` 的 `heartbeat` |
 
 官方 App Server 文档确认 `thread/start` 创建 thread、`thread/name/set` 修改用户可见名称、`turn/start` 向已有 thread 增加一轮，`thread/list/read` 用于发现和读取。当前 Codex App 高层工具把这些产品原语包装成面向本次运行的调用；高层字段不是 App Server JSON-RPC 的逐字段复制。
 
@@ -48,8 +49,11 @@
 - `list_projects`
 - 写入型任务需要的 `handoff_thread`
 - `get_handoff_status`
+- 可选的 `automation_update` heartbeat；用于控制面退化时唤醒当前主控任务，不用于创建 Worker
 
 缺少创建、改名、跨任务消息、等待或读取任一核心能力时，不创建无法满足协议的 Worker。写入型任务缺少 Handoff 时，在派发前确定用户认可的替代成果回收方式。
+
+用户要求持续推进、监控到完成或已经启动 Goal 时，把 heartbeat 视为跨 turn 无限恢复的核心能力。能力缺失不授权主控在控制面故障后停止；必须在派发前说明环境限制，并在当前 Goal/turn 内保持无限退避重试。不得把 heartbeat 降级成新的 cron Worker 或独立任务。
 
 归档能力不属于自动编排工具集合。即使运行时暴露归档工具，也不得自动调用；`✅` 和 `🗑️` 仅表示任务通过归档就绪门、用户可以人工归档。用户明确要求由 Codex 归档时，应作为自动编排之外的独立、精确目标操作处理。
 
@@ -133,6 +137,8 @@ create_thread({
 直接创建通常返回 `threadId` 和 `hostId`。排队创建 worktree 时可能先返回 `clientThreadId`；它不是可等待或可改名的真实任务 ID。
 
 创建调用后，只把 `threadId/clientThreadId/hostId` 和简短摘要写入 outcome，不把完整 Prompt 或原始工具输出落入账本。结果含糊时记录 `UNKNOWN`，先用任务列表核对，不能直接重复创建。
+
+直接调用 `create_thread`。不要把高层任务工具放入可被终止的 shell、PTY 或 yielded exec cell；终止外层执行不能证明服务端请求已取消，只会把 outcome 变成含糊状态。
 
 ## 4. 标题和跨任务消息
 
@@ -232,6 +238,18 @@ read_thread({
 2. 对目标 Worker 执行一次紧凑 `read_thread`，默认 `turnLimit: 5`、`includeOutputs: false`；只有核验证据需要时才有限读取输出。
 3. 使用 `send_message_to_thread` 发送 protocol reference 定义的 `CHECKPOINT`，取得安全边界快照后再决定是否 `REPLAN`。
 4. 不通过提高轮询频率、重复读取大输出或持续发送催促消息制造“看起来很忙”的状态。
+
+### 5.3 当前任务 heartbeat
+
+当任务控制面持续异常，而原始授权要求主控继续推进且当前 turn 将结束时，使用 `automation_update` 创建或更新 `kind=heartbeat`、目标为当前主控任务的分钟级唤醒：
+
+1. 使用包含 `runId` 的确定性名称；创建前先检查现有 automations，优先更新同名项，禁止重复。
+2. Prompt 只要求从 ledger `snapshot` 恢复、核对 pending `INTENT/UNKNOWN`、按本节退避规则做一次恢复审计、未恢复时保持 heartbeat 活跃、恢复后继续原 DAG；不得在 Prompt 中扩大权限、重复创建 Worker 或保存凭据。
+3. heartbeat 是主控续跑通道，不是 Worker，不进入 manifest、`activeCount` 或 Worker 标题状态机。
+4. 原任务 API 恢复、运行终态、用户暂停或取消后，停用或删除该 heartbeat。
+5. 不向用户展示原始 RRULE；按当前 `automation_update` schema 生成分钟级 cadence。
+
+heartbeat 不替代当前 turn 内的 5/15/30/60 秒退避；两次无响应后进入每 2 分钟一次的单一核对，并无限循环。熔断只表示降频，不是最大重试次数、最长等待时间或停止条件。heartbeat 避免 Controller 输出 final/blocked 后无限等待用户手工唤醒。
 
 ## 6. worktree 与起始状态
 
@@ -334,7 +352,7 @@ handoff_thread({
 
 - 记录 `PROVISIONING`。
 - 使用任务列表解析真实 `threadId`。
-- 有限重试后仍失败则报告，不创建重复 Worker。
+- 按 5.3 的无限退避 heartbeat 持续解析，直到取得真实 `threadId`、外部事实确认创建失败，或用户明确暂停/取消；期间可以报告 `DEGRADED`，但不停止、不进入 `BLOCKED`，也不创建重复 Worker。若外部事实确认创建失败，闭合本轮 operation 后回到派发流程，用新 request ID 发起一个新的受控尝试；确认失败后的重新尝试次数无上限。
 
 ### 9.2 Worker 未发送 `DONE`
 
@@ -345,13 +363,15 @@ handoff_thread({
 
 ### 9.3 Handoff 失败
 
-- 查询操作终态。
+- 先查询操作终态；Handoff 或 status timeout、失联、结果含糊时保持 `UNKNOWN` 并按 9.6 无限核对，不得进入 `BLOCKED` 或重复发起 Handoff。
+- 只有取得明确失败终态后才执行以下真实工作阻塞流程。
 - 保留 worktree。
 - 标记 `⌛️` 并报告。
 - 不自动清理或归档。
 
 ### 9.4 远程失联
 
+- 本节只适用于任务控制 API 健康且外部事实确认远程主机不可用；若无法确认是因为任务控制 API timeout 或失联，按 9.6 无限恢复。
 - 用最后有效 `hostId` 做一次有限核对。
 - 只读工作可以在授权范围内创建 1 个本地替代 Worker。
 - 未同步的远程写入成果不能标记 `✅`。
@@ -367,8 +387,11 @@ handoff_thread({
 ### 9.6 控制面故障
 
 - 引号、路径、参数、renderer 输入或临时 JSON 错误在确认无未知部分写入和外部副作用后，按本地纠错预算修正；不得把 Worker 改成 `BLOCKED`。
-- 标题、cursor、wait/read/list 或跨任务消息失败时保留真实生命周期；任务服务临时异常按 5/15/30/60 秒上限退避，连续 2 次 timeout/无响应后熔断 2 分钟。
+- 标题、cursor、create/wait/read/list 或跨任务消息失败时保留真实生命周期；任务服务异常按 5/15/30/60 秒退避，连续 2 次 timeout/无响应后每 2 分钟做一次单一核对并无限循环。熔断只降低频率，不停止恢复。
 - 账本持久化失败时停止新的外部副作用并进入运行级 `DEGRADED`；这是控制面恢复状态，不是 `WORK_BLOCKER`。
+- 用户已要求持续推进且原目标未完成时，退避跨越 turn 必须使用 5.3 的当前任务 heartbeat；不得以“恢复控制面连接”为理由要求用户发送“继续”。
+- 控制面故障无论连续失败次数或持续时间都不能满足 blocked/终止门槛；heartbeat 不可用时也必须在当前 Goal/turn 内无限退避。只有与控制面无关的真实工作阻塞或用户明确暂停/取消才能停止。
+- operation 处于 `UNKNOWN` 时，无限重试只重复只读恢复核对，不得重复 create/message/title/Handoff 等外部写操作。只有外部事实排除副作用并把上一轮闭合为 `FAILED` 后，才用新 request ID 发起一个新的受控尝试；该循环无次数或时长上限，任何时刻只允许一个在途写操作。
 
 ## 10. 官方依据
 
@@ -376,5 +399,6 @@ handoff_thread({
 - Codex App Server API：<https://learn.chatgpt.com/docs/app-server#api-overview>
 - Codex Skills：<https://learn.chatgpt.com/docs/customization/overview#skills>
 - Codex Worktrees 与 Handoff：<https://learn.chatgpt.com/docs/environments/git-worktrees#terminology>
+- Codex Scheduled tasks 与当前任务 heartbeat：<https://learn.chatgpt.com/docs/automations#schedule-a-task-inside-a-chat>
 
 官方文档描述底层产品行为以及 Skill 可以包含 scripts/references；本文件中的 `create_thread`、`set_thread_title`、`send_message_to_thread`、`wait_threads`、`handoff_thread` 和 `get_handoff_status` 字段来自当前 Codex App 运行时 schema。二者冲突时，说明差异并优先遵守实际可调用 schema。

@@ -28,6 +28,7 @@ description: Coordinate the current Codex task as a Controller with multiple ind
 - 保留单一决策中心：Worker 负责执行和提供证据，主控负责范围、决策、冲突处理、验收和最终汇总。
 - 主控是本地 SQLite 账本的唯一写者。Worker 不读取、写入、复制或删除主控账本，只通过跨任务消息报告。
 - 只通过 `scripts/ledger.py` 写账本；不得直接执行 SQL 修改状态。`scripts/dispatch.py` 只验证和渲染，不能替代真实 Codex 工具调用。
+- 用户要求持续推进、监控到完成或已经启动 Goal 时，控制面故障不得结束运行或把恢复责任转给用户；主控必须保持 `DEGRADED` 并使用当前任务的自主重试或 heartbeat 无限续跑。重试次数、连续失败次数和总等待时长均无上限，退避只降低调用频率，不是停止、`BLOCKED`、goal blocked 或 final 的条件。只有控制面恢复、出现与控制面无关的真实用户决定，或用户明确暂停/取消才能结束该恢复循环。
 
 ## 读取运行协议
 
@@ -64,8 +65,9 @@ description: Coordinate the current Codex task as a Controller with multiple ind
    - 向其他任务发送消息；
    - 列出项目；
    - 写代码时还需具备 Handoff 及其状态查询能力，或在派发前确定用户认可的替代回收方案。
+   - 发现当前任务 heartbeat/automation 能力；用户要求持续推进、监控到完成或启动 Goal 时，把它视为跨 turn 无限恢复的核心能力。缺失时必须在派发前说明环境限制，并在当前 Goal/turn 内保持无限退避重试，不能在发生控制面故障后用 blocked/final 代替续跑。
 2. 生成短且本次唯一的 `runId`，例如 `R7K2`。
-3. 获取并验证当前主控的 `threadId`；跨主机时同时获取 `hostId`。优先使用运行时直接提供的地址；缺失时才按 ledger reference 的受限 bootstrap 设置唯一 `runId` 标题并从任务列表解析。不能得到唯一匹配时停止。
+3. 获取并验证当前主控的 `threadId`；跨主机时同时获取 `hostId`。优先使用运行时直接提供的地址；缺失时才按 ledger reference 的受限 bootstrap 设置唯一 `runId` 标题并从任务列表解析。任务 API timeout 或失联导致无法核对时按 5.1 无限恢复；只有控制面健康但存在多个真实匹配、因而无法唯一寻址时才停止并请求修正。
 4. 按 ledger reference 初始化稳定的本地 SQLite 账本，并读取 stdout 返回的 `databasePath`。Git 项目必须用本地 `.git/info/exclude` 排除运行目录。初始账本无法安全创建时不派发 Worker。
 5. 使用 dispatch script 渲染匹配 `runLanguage` 的 `PLANNING` 标题。除寻址 bootstrap 外，先写 `SET_TITLE` intent，再调用实际标题工具并写 outcome。
 6. 解析并发上限：
@@ -106,7 +108,7 @@ description: Coordinate the current Codex task as a Controller with multiple ind
    - 文件写入边界、成果回收方式和验收命令。
    - 2–5 个可观察里程碑、首个健康检查点和已知长命令的预期墙钟时间。
    - 失败分类策略和本地纠错预算。默认允许对已经证明无部分写入、无边界变化、无权限扩张的控制/命令输入错误本地纠正一次。
-4. 用渲染结果的最小化 request 写 `CREATE_THREAD` intent；之后调用实际创建工具，再用清理后的稳定 ID 写 outcome。除非用户明确指定，否则不覆盖 Worker 的模型或 reasoning 配置。
+4. 用渲染结果的最小化 request 写 `CREATE_THREAD` intent；之后直接调用实际高层创建工具，再用清理后的稳定 ID 写 outcome。不得把 `create_thread` 或后续 `list/read/wait` 包进可能被终止的 shell、PTY 或 yielded exec cell，也不得通过终止外层等待取消含糊的在途创建。除非用户明确指定，否则不覆盖 Worker 的模型或 reasoning 配置。
 5. 记录返回的 `threadId` 或 `clientThreadId`、`hostId`、环境和状态。工具超时或结果含糊时保留 pending/unknown，先核对外部事实，不重复创建。
 6. 获得真实 `threadId` 后，按相同 intent/tool/outcome 顺序设置渲染好的 `RUNNING` 标题。
 7. 首波派发完成后，以 ledger 中的实际活跃数渲染 `TRACKING` 主控标题，并按 intent/tool/outcome 更新。
@@ -128,13 +130,26 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 - `PROVISIONING/RUNNING` Worker 最迟每 60 秒主动观察一次；`REVIEW` 在验收动作发生时读取；`BLOCKED` 只在收到决定、外部条件变化或用户要求时复核。内部观察不等于用户可见消息，正常等待 timeout 也不是控制系统阻塞。
 - 派发、阻塞、验收完成、重试、范围变化和替换发生时立即向用户汇报。
 - 没有状态变化时，不为每轮观察发送消息；只有运行仍需要用户关注时，最长约每 10 分钟发送一次有信息量的摘要。
-- 任务服务返回临时不可用、限流或传输错误时，保持 Worker 状态并按 5/15/30/60 秒上限退避；连续 2 次 timeout 或无响应后停止切换 `list/read/wait` 变体探测 2 分钟。只有状态确实含糊时做一次任务列表或紧凑读取核对，不并发重试、不改标题。timeout 不是 Worker 消失或工作阻塞的证据。
+- 任务服务返回临时不可用、限流或传输错误时，保持 Worker 状态并按 5/15/30/60 秒退避；连续 2 次 timeout 或无响应后停止切换 `list/read/wait` 变体探测 2 分钟，之后每 2 分钟做一次单一恢复核对并无限循环。只有状态确实含糊时做一次任务列表或紧凑读取核对，不并发重试、不改标题。timeout 不是 Worker 消失或工作阻塞的证据；没有最大重试次数或最长恢复时长。
 - 不把 Worker 的自称完成直接视为验收通过。
 - 不把消息频繁等同于有效进展。每次 `PROGRESS` 更新当前里程碑、已经关闭和剩余的验收项、预计剩余时间，以及正在运行的已声明长命令。
 - 每条可接受的 Worker 消息先以 `WORKER_MESSAGE_APPLIED` 落账，再执行标题、回复、Handoff 或下一波派发。旧 `seq` 只确认忽略，不重复状态变化。
 - 只有 cursor 确实变化时才保存。跨任务消息先由账本分配 `controllerSeq`，再用 dispatch script 渲染，按 intent/tool/outcome 发送。
 
 把 `PROVISIONING`、`RUNNING`、`BLOCKED` 和 `REVIEW` 都计入活跃数。`ACCEPTED` 或 `RETIRED` 才释放槽位。
+
+### 5.1 控制面自主恢复与 heartbeat
+
+当 `create/list/read/wait/send/title/handoff-status` 任一任务控制调用超时、失联或结果含糊时：
+
+1. 保留 Worker 的真实生命周期；外部结果含糊的 operation 写 `UNKNOWN`，并用 `RUN_UPDATED status=DEGRADED` 记录运行级降级。控制面失败无论重复多少次、持续多久，都不得累计成 Worker `AT_RISK/STALLED/BLOCKED`，不得调用 `update_goal(status=blocked)`，不得输出等待用户恢复的 final。
+2. 先继续不依赖新决定或新外部副作用的安全工作；按 5/15/30/60 秒退避，随后每 2 分钟执行一次单一恢复核对并无限循环，不在 `list/read/wait` 之间高频切换。熔断表示降频，不表示终止。
+3. 原目标尚未完成且当前 turn 将结束时，若当前任务 heartbeat 工具可用，必须创建或更新一个附着到当前主控任务的分钟级 heartbeat。名称包含 `runId` 且可唯一查找；Prompt 要求从 ledger `snapshot` 恢复、核对所有 `INTENT/UNKNOWN`、只在外部事实明确后重试，并在恢复或运行终态后停用/删除自身。heartbeat 不是 Worker，不占并发槽位，不得创建新任务。
+4. heartbeat 创建前检查是否已有同名活动项并优先更新，禁止重复。创建后可向用户报告 `DEGRADED + 自动重试已启用`，但不得要求用户发送“继续”。
+5. heartbeat 工具不可用时，主控在当前 Goal/turn 内继续每 2 分钟的无限退避重试；不得因为 heartbeat 缺失、产品控制调用持续失败、重试次数或经过时长进入 blocked/final。控制面恢复本身不是用户决定，用户也不是恢复调度器。
+6. 恢复后先用任务列表、即时快照、必要的紧凑读取和 worktree 事实核对原 operation。只在原 `CREATE_THREAD` 已确认 `FAILED` 且目标 Worker 不存在时，恢复 task 为 `QUEUED` 并使用新 request ID 发起一次新的受控尝试；若该尝试再次明确失败，重新核对后继续同样循环且总次数无上限。每轮只允许一个在途 create，`UNKNOWN` 永不直接重建。
+7. 恢复闭合后用 `RUN_UPDATED status=ACTIVE`，更新 ledger outcome/cursor，停用或删除恢复 heartbeat，再继续原 DAG。运行完成、用户暂停或取消时同样清理该 heartbeat。
+8. operation 处于 `INTENT/UNKNOWN` 时，无限循环只重复只读恢复审计，不重复含糊的外部写操作。只有外部事实排除副作用并把上一轮闭合为 `FAILED` 后，才用新 request ID 发起一个新的受控写尝试；“核对 → 明确失败 → 单次新尝试”循环本身没有次数或时长上限。`UNKNOWN`、幂等门、文件写边界、权限和不可逆操作规则始终有效，任何时刻不得并发或盲目重复创建、发送、Handoff 或改名。
 
 ## 6. 效率审查与重规划
 
@@ -167,7 +182,7 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 
 收到 `BLOCKED` 或发现等待用户/外部条件时：
 
-1. 先按 Worker 证据分类：步骤契约接受的结果是 `EXPECTED_RESULT`；引号、路径、参数、解析器、命令形状、已知 wrapper 或已证明无部分写入的 patch 错误是 `RECOVERABLE_CONTROL`；标题、cursor、wait、renderer、临时 JSON 或消息传输失败是 `CONTROL_DEGRADED`；只有需要决定/权限/依赖/边界变化、存在不可逆风险、timeout、未知部分写入或纠错预算耗尽才是 `WORK_BLOCKER`。
+1. 先按 Worker 证据分类：步骤契约接受的结果是 `EXPECTED_RESULT`；引号、路径、参数、解析器、命令形状、已知 wrapper 或已证明无部分写入的 patch 错误是 `RECOVERABLE_CONTROL`；标题、cursor、任务 `create/list/read/wait/send/title/handoff-status` timeout、renderer、临时 JSON 或消息传输失败是 `CONTROL_DEGRADED`；只有需要决定/权限/依赖/边界变化、存在不可逆风险、实际工作步骤 timeout、未知部分写入或纠错预算耗尽才是 `WORK_BLOCKER`。
 2. Worker 把前三类误报为 `BLOCKED` 时，保留原始消息用于审计，但以 `blockerDisposition=RECOVERABLE` 落账并保持 `RUNNING`；只有 `WORK_BLOCKER` 使用 `blockerDisposition=BLOCK`、进入生命周期 `BLOCKED` 并改为 `⌛️`。
 3. 对真实工作阻塞，先落账状态和证据，再使用 dispatch script 渲染匹配 `runLanguage` 的 `BLOCKED` 标题，按 intent/tool/outcome 改名。
 4. 判断是否能在原始授权内安全决定。能决定时，记录决定；先写消息 intent 取得 `controllerSeq`，再渲染并发送 `DECISION`，Worker 恢复后改回 `✍️`。
@@ -180,7 +195,7 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 ### 7.1 控制面故障不得冒充工作阻塞
 
 - 标题、cursor、等待快照、renderer 输入、临时 JSON、命令引号或任务消息传输属于控制面；它们失败时保留 Worker 的真实生命周期。
-- 对确认无外部副作用的控制错误，在本地纠错预算内修正一次；任务服务短暂失败按退避规则处理。未恢复时标记运行 `DEGRADED`，继续不依赖新决定的安全工作，不把 Worker 改成 `BLOCKED`。
+- 对确认无外部副作用的控制错误，在本地纠错预算内修正一次；任务服务失败按无限退避和 heartbeat 规则处理。未恢复时始终保持运行 `DEGRADED`，继续不依赖新决定的安全工作，不把 Worker 或 Goal 改成 `BLOCKED`，不输出 final，也不把“恢复任务控制面连接”伪装成需要用户批准的决定。
 - 账本持久化失败时停止新的外部副作用并进入运行级 `DEGRADED` 恢复；它是控制系统故障，不是 Worker 工作阻塞。
 
 ## 8. 终止、废弃与取代
@@ -213,7 +228,7 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
    - 跨主机时先转移到本地匹配项目 worktree，并更新账本中的 `hostId`；
    - 再回收到 Local；
    - 在 Local 上运行组合验证。
-7. Handoff 或组合验证冲突时进入 `BLOCKED` 并改为 `⌛️`，保留 worktree，不做破坏性 Git 清理，不让 Worker 无边界地修改 Local。
+7. 只有 Handoff 已取得明确失败结果，或组合验证发现真实冲突时，才进入 `BLOCKED` 并改为 `⌛️`；Handoff/status timeout 或结果含糊按 5.1 保持 `UNKNOWN + DEGRADED` 无限核对。始终保留 worktree，不做破坏性 Git 清理，不让 Worker 无边界地修改 Local。
 8. 只有以下归档就绪条件全部满足后，才进入 `ACCEPTED`：
    - 原 Worker Prompt 范围已经完成，且不存在待决策事项；
    - 主控验收和必要的 Local 组合验证通过；
@@ -257,5 +272,6 @@ worktree 只返回 `clientThreadId` 时，将 Worker 记为 `PROVISIONING`。在
 5. 只应用更大的 Worker `seq`；新主控命令继续账本分配的 `controllerSeq`。
 6. 账本损坏或丢失时按 ledger reference 的备份或保守重建流程执行；无法唯一核对时阻塞并向用户报告。
 7. 不因恢复失败创建重复 Worker，也不把内存状态冒充持久账本。
+8. 若存在本次运行的恢复 heartbeat，先更新而非重复创建；控制面恢复、运行完成、用户暂停或取消后停用/删除它，避免无人值守的残留唤醒。
 
-始终把 SQLite 账本作为逻辑状态、标题作为用户可见投影。账本写入失败时停止新的外部副作用并进入 `DEGRADED` 恢复；标题更新失败时有限重试并报告，但不要丢弃 Worker 成果或违反禁止归档规则。
+始终把 SQLite 账本作为逻辑状态、标题作为用户可见投影。账本写入失败时停止新的外部副作用并进入 `DEGRADED` 无限恢复；标题更新失败时纳入同一无限退避循环，但不要丢弃 Worker 成果、重复含糊写操作或违反禁止归档规则。
